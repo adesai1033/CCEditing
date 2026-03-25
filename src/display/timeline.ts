@@ -59,6 +59,10 @@ function assignWidths(clips: Clip[], barWidth: number): number[] {
   const total = clips.reduce((sum, c) => sum + clipDuration(c), 0);
   if (total === 0 || clips.length === 0) return clips.map(() => 1);
 
+  // If there are more clips than bar characters, every clip gets 1 char.
+  // The bar will slightly overflow the box but won't crash.
+  if (clips.length >= barWidth) return clips.map(() => 1);
+
   // Give each clip its proportional share, floored to at least 1
   const raw = clips.map((c) => Math.max(1, Math.floor((clipDuration(c) / total) * barWidth)));
   let used = raw.reduce((a, b) => a + b, 0);
@@ -77,11 +81,14 @@ function assignWidths(clips: Clip[], barWidth: number): number[] {
     idx++;
   }
 
-  // If we overshoot (rounding edge case), trim from the largest
+  // If we overshoot, trim from largest clips (skipping any at minimum width 1)
+  let trimIdx = 0;
+  const bySize = raw.map((w, i) => ({ i, w })).sort((a, b) => b.w - a.w);
   while (used > barWidth) {
-    const maxIdx = raw.indexOf(Math.max(...raw));
-    if (raw[maxIdx]! > 1) { raw[maxIdx]!--; used--; }
-    else break;
+    const candidate = bySize[trimIdx % bySize.length]!;
+    if (candidate.w > 1) { raw[candidate.i]!--; candidate.w--; used--; }
+    trimIdx++;
+    if (trimIdx > barWidth * 2) break; // safety valve
   }
 
   return raw;
@@ -155,15 +162,18 @@ export function renderTimeline(state: ProjectState, terminalWidth?: number): str
     markerSeconds.push(t);
   }
 
+  let nextFreePos = 0;
   for (const t of markerSeconds) {
     const pos = Math.round((t / totalDuration) * (barWidth - 1));
     const label = formatMarker(t);
-    // Place label starting at pos, clamped to bar
     const start = Math.min(pos, barWidth - label.length);
+    // Place tick regardless, but skip label if it would overlap the previous one
+    if (pos < barWidth) tickChars[pos] = "┬";
+    if (start < nextFreePos) continue;
     for (let i = 0; i < label.length; i++) {
       if (start + i < barWidth) rulerChars[start + i] = label[i]!;
     }
-    if (pos < barWidth) tickChars[pos] = "┬";
+    nextFreePos = start + label.length + 1; // +1 minimum gap between labels
   }
 
   const rulerLine = chalk.dim(rulerChars.join(""));
@@ -191,7 +201,8 @@ export function renderTimeline(state: ProjectState, terminalWidth?: number): str
   clipBar += lastColor("│");
 
   // ── Bottom bar border ─────────────────────────────────────────────────────────
-  const bottomBar = chalk.dim("└" + "─".repeat(barWidth - 1));
+  // Width must match the clip bar: sum(widths) + 1 final border = barWidth + 1
+  const bottomBar = chalk.dim("└" + "─".repeat(barWidth));
 
   // ── Summary line ──────────────────────────────────────────────────────────────
   const summary = chalk.dim(
