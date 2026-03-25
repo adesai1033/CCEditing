@@ -1,3 +1,5 @@
 node_modules/
 dist/
 .DS_Store
+*.mp4
+!test-assets/*.mp4
