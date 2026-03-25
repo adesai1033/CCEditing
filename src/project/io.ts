@@ -59,6 +59,16 @@ export async function loadProject(filePath: string): Promise<ProjectState> {
     );
   }
 
+  if (typeof state["name"] !== "string") {
+    throw new Error(`Project file is missing required field "name": ${filePath}`);
+  }
+  if (!Array.isArray(state["sources"])) {
+    throw new Error(`Project file is missing required field "sources": ${filePath}`);
+  }
+  if (typeof state["timeline"] !== "object" || state["timeline"] === null || !Array.isArray((state["timeline"] as Record<string, unknown>)["clips"])) {
+    throw new Error(`Project file is missing required field "timeline.clips": ${filePath}`);
+  }
+
   return parsed as ProjectState;
 }
 

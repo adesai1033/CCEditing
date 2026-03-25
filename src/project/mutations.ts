@@ -153,7 +153,7 @@ export function renameClip(
       ...state,
       timeline: {
         clips: state.timeline.clips.map((c) =>
-          c.id === clipId ? { ...c, label } : c
+          c.id === clipId ? { ...c, label: label.trim() } : c
         ),
       },
     }),

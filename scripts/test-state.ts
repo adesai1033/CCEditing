@@ -7,7 +7,7 @@
  */
 import path from "node:path";
 import { createProject, saveProject, loadProject } from "../src/project/io.js";
-import { addSource, trimClip, reorderClip, renameClip, removeClip } from "../src/project/mutations.js";
+import { addSource, trimClip, reorderClip, renameClip, removeClip, removeSource } from "../src/project/mutations.js";
 import type { MediaInfo } from "../src/media/types.js";
 
 const OUT_FILE = "/tmp/test-project.cutcli.json";
@@ -138,13 +138,54 @@ state = r6.state;
 assert(state.timeline.clips.length === 1, "one clip remains");
 assert(state.sources.length === 2, "source files unchanged");
 
-// 9. Save to disk
-console.log("\n9. saveProject");
+// 9. removeSource — cascade deletes all referencing clips
+console.log("\n9. removeSource (cascade)");
+// Add a third source with two clips referencing it
+const r7 = addSource(state, mockMedia("extra.mp4", 30));
+assertOk(r7, "addSource extra.mp4 ok");
+state = r7.state;
+const extraSource = state.sources.find((s) => s.fileName === "extra.mp4")!;
+const extraClip = state.timeline.clips.find((c) => c.sourceId === extraSource.id)!;
+// Trim the extra clip to create a second clip from same source
+const r8 = addSource(state, mockMedia("extra.mp4", 30));
+assertOk(r8, "addSource extra.mp4 second instance ok");
+state = r8.state;
+const clipsBefore = state.timeline.clips.filter((c) => c.sourceId === extraSource.id).length;
+assert(clipsBefore === 1, "one clip references extra source before removal");
+const r9 = removeSource(state, extraSource.id);
+assertOk(r9, "removeSource ok");
+state = r9.state;
+assert(!state.sources.find((s) => s.id === extraSource.id), "source removed");
+assert(!state.timeline.clips.find((c) => c.id === extraClip.id), "referencing clip removed");
+assertFail(removeSource(state, "nonexistent-id"), "unknown sourceId rejected");
+
+// 10. renameClip trims whitespace
+console.log("\n10. renameClip trims whitespace");
+const remainingClip = state.timeline.clips[0]!;
+const r10 = renameClip(state, remainingClip.id, "  Padded Label  ");
+assertOk(r10, "renameClip with padded label ok");
+state = r10.state;
+assert(state.timeline.clips[0]!.label === "Padded Label", "label stored without surrounding whitespace");
+
+// 11. loadProject rejects malformed files
+console.log("\n11. loadProject structural validation");
+const { writeFile } = await import("node:fs/promises");
+await writeFile("/tmp/bad-project.cutcli.json", JSON.stringify({ version: 1 }), "utf-8");
+try {
+  await loadProject("/tmp/bad-project.cutcli.json");
+  console.error("  ✗ FAIL: should have thrown for missing fields");
+  process.exit(1);
+} catch (e) {
+  console.log(`  ✓ missing fields throws (${(e as Error).message})`);
+}
+
+// 12. Save to disk
+console.log("\n12. saveProject");
 await saveProject(state, OUT_FILE);
 console.log(`  ✓ saved to ${OUT_FILE}`);
 
-// 10. Load back and verify
-console.log("\n10. loadProject");
+// 13. Load back and verify
+console.log("\n13. loadProject");
 const loaded = await loadProject(OUT_FILE);
 assert(loaded.name === state.name, "name matches");
 assert(loaded.version === state.version, "version matches");
@@ -153,8 +194,8 @@ assert(loaded.timeline.clips.length === state.timeline.clips.length, "clip count
 assert(loaded.timeline.clips[0]!.id === state.timeline.clips[0]!.id, "clip id matches");
 assert(loaded.updatedAt === state.updatedAt, "updatedAt matches");
 
-// 11. Load error cases
-console.log("\n11. loadProject error cases");
+// 14. Load error cases
+console.log("\n14. loadProject error cases");
 try {
   await loadProject("/tmp/nonexistent.cutcli.json");
   console.error("  ✗ FAIL: should have thrown for missing file");
