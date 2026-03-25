@@ -3,18 +3,25 @@ import type { TrimOperation, EditOperation } from "./types.js";
 /**
  * Build the FFmpeg argument list for a trim operation.
  *
- * Strategy: input seeking (-ss before -i) for fast seeks to keyframe,
- * then -t for duration (not -to, which behaves differently with input seeking).
- * Stream copy (-c copy) avoids re-encoding.
+ * Strategy: output seeking (-ss after -i) forces FFmpeg to decode every frame
+ * from the nearest keyframe to the exact timestamp, giving frame-accurate cuts.
+ * We re-encode the video (libx264, CRF 18, fast preset) because stream copy
+ * cannot produce frame-accurate cuts — it can only split on keyframe boundaries.
+ * Audio is re-encoded to AAC to stay in sync with the new video segment.
+ *
+ * Tradeoff vs stream copy: slower (seconds vs milliseconds for large files),
+ * but the output starts and ends on the exact requested frame.
  */
 export function buildTrimArgs(op: TrimOperation): string[] {
   const duration = op.end - op.start;
   return [
-    "-ss", String(op.start),
     "-i", op.input,
+    "-ss", String(op.start),
     "-t", String(duration),
-    "-c", "copy",
-    "-avoid_negative_ts", "make_zero",
+    "-c:v", "libx264",
+    "-crf", "18",
+    "-preset", "fast",
+    "-c:a", "aac",
     "-y",
     op.output,
   ];
