@@ -105,6 +105,58 @@ export function formatFps(fps: number): string {
   return Number.isInteger(fps) ? String(fps) : fps.toFixed(2);
 }
 
+// ── Trim result display ───────────────────────────────────────────────────────
+
+export interface TrimResultDisplay {
+  inputName: string;
+  inputDuration: number;
+  start: number;
+  end: number;
+  outputPath: string;
+  outputSize: number;
+}
+
+export function renderTrimSuccess(r: TrimResultDisplay): string {
+  const trimDuration = r.end - r.start;
+  const range = `${formatTime(r.start)} → ${formatTime(r.end)} (${Math.round(trimDuration)}s)`;
+
+  const rows: [string, string][] = [
+    ["Input",  `${r.inputName} (${formatDuration(r.inputDuration)})`],
+    ["Range",  range],
+    ["Output", `${r.outputPath} (${formatFileSize(r.outputSize)})`],
+  ];
+
+  const labelWidth = Math.max(...rows.map(([l]) => l.length));
+  const stripAnsi = (s: string) => s.replace(/\x1B\[[0-9;]*m/g, "");
+
+  const contentRows = rows.map(([label, value]) =>
+    `${chalk.dim(label.padEnd(labelWidth))}  ${chalk.white(value)}`
+  );
+
+  const innerWidth = Math.max(...contentRows.map((r) => stripAnsi(r).length)) + 2;
+  const padRight = (stripped: string, raw: string) =>
+    `  │ ${raw}${" ".repeat(Math.max(0, innerWidth - stripped.length))} │`;
+
+  const lines = [
+    `  ┌${"─".repeat(innerWidth + 2)}┐`,
+    `  │ ${chalk.bold.green("✓ Trimmed successfully")}${" ".repeat(Math.max(0, innerWidth - "✓ Trimmed successfully".length))} │`,
+    `  ├${"─".repeat(innerWidth + 2)}┤`,
+    ...contentRows.map((r) => padRight(stripAnsi(r), r)),
+    `  └${"─".repeat(innerWidth + 2)}┘`,
+  ];
+
+  return lines.join("\n");
+}
+
+function formatTime(seconds: number): string {
+  const totalSecs = Math.floor(seconds);
+  const h = Math.floor(totalSecs / 3600);
+  const m = Math.floor((totalSecs % 3600) / 60);
+  const s = totalSecs % 60;
+  if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
 // ── Box renderer ──────────────────────────────────────────────────────────────
 
 export function renderMediaInfo(info: MediaInfo): string {
