@@ -233,6 +233,16 @@ program
     console.log();
   });
 
+// ── repl ──────────────────────────────────────────────────────────────────────
+
+program
+  .command("repl")
+  .description("Launch the interactive REPL editor")
+  .action(async () => {
+    const { startRepl } = await import("../repl/index.js");
+    startRepl();
+  });
+
 program.parse();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
