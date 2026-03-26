@@ -6,5 +6,10 @@ export interface TrimOperation {
   output: string;  // file path
 }
 
-// Union grows in future slices (concat, overlay, etc.)
-export type EditOperation = TrimOperation;
+export interface ConcatOperation {
+  type: "concat";
+  segments: string[]; // absolute paths to pre-trimmed segment files, in order
+  output: string;
+}
+
+export type EditOperation = TrimOperation | ConcatOperation;

@@ -1,4 +1,4 @@
-import type { TrimOperation, EditOperation } from "./types.js";
+import type { TrimOperation, ConcatOperation, EditOperation } from "./types.js";
 
 /**
  * Build the FFmpeg argument list for a trim operation.
@@ -27,9 +27,20 @@ export function buildTrimArgs(op: TrimOperation): string[] {
   ];
 }
 
-export function buildArgs(op: EditOperation): string[] {
+/** Returns the content of an FFmpeg concat demuxer list file. */
+export function buildConcatFileContent(segmentPaths: string[]): string {
+  return segmentPaths.map((p) => `file '${p}'`).join("\n") + "\n";
+}
+
+export function buildConcatArgs(op: ConcatOperation, listFilePath: string): string[] {
+  return ["-f", "concat", "-safe", "0", "-i", listFilePath, "-c", "copy", "-y", op.output];
+}
+
+export function buildArgs(op: EditOperation, listFilePath?: string): string[] {
   switch (op.type) {
     case "trim":
       return buildTrimArgs(op);
+    case "concat":
+      return buildConcatArgs(op, listFilePath!);
   }
 }

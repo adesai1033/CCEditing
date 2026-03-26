@@ -1,9 +1,12 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { stat } from "node:fs/promises";
-import type { EditOperation, TrimOperation } from "./types.js";
+import { stat, access, writeFile, unlink } from "node:fs/promises";
+import { constants } from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import type { EditOperation, TrimOperation, ConcatOperation } from "./types.js";
 import { validateTrim } from "./validator.js";
-import { buildArgs } from "./ffmpeg.js";
+import { buildArgs, buildConcatFileContent } from "./ffmpeg.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -18,8 +21,15 @@ export async function execute(op: EditOperation): Promise<ExecutionResult> {
     return { ok: false, error: validation.error, code: "VALIDATION" };
   }
 
+  // For concat, write the list file and pass its path into buildArgs
+  let concatListPath: string | undefined;
+  if (op.type === "concat") {
+    concatListPath = path.join(os.tmpdir(), `cutcli-concat-${Date.now()}.txt`);
+    await writeFile(concatListPath, buildConcatFileContent(op.segments), "utf-8");
+  }
+
   // Build args and run FFmpeg
-  const args = buildArgs(op);
+  const args = buildArgs(op, concatListPath);
   try {
     await execFileAsync("ffmpeg", args);
   } catch (err: unknown) {
@@ -33,8 +43,11 @@ export async function execute(op: EditOperation): Promise<ExecutionResult> {
     }
     const stderr = (error.stderr ?? String(error)).trim();
     const friendly = parseFfmpegError(stderr);
+    if (concatListPath) await unlink(concatListPath).catch(() => {});
     return { ok: false, error: friendly, code: "FFMPEG_FAILED" };
   }
+
+  if (concatListPath) await unlink(concatListPath).catch(() => {});
 
   // Read output file size
   const outputStat = await stat(op.output);
@@ -50,6 +63,17 @@ async function validateOperation(op: EditOperation): Promise<{ ok: true; duratio
   switch (op.type) {
     case "trim":
       return validateTrim(op as TrimOperation);
+    case "concat": {
+      const concatOp = op as ConcatOperation;
+      for (const seg of concatOp.segments) {
+        try {
+          await access(seg, constants.F_OK);
+        } catch {
+          return { ok: false, error: `Segment file not found: ${seg}` };
+        }
+      }
+      return { ok: true, duration: 0 };
+    }
   }
 }
 
