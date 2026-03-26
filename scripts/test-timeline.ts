@@ -107,4 +107,56 @@ print("Empty timeline", createProject("Test"));
   console.log(renderTimeline(s, 30));
 }
 
+// 8. Exactly 72 clips — boundary: groupClips should NOT merge (each is own group)
+{
+  let s = createProject("Boundary 72 Clips");
+  for (let i = 1; i <= 72; i++) {
+    const r = addSource(s, mockMedia(`scene-${String(i).padStart(2, "0")}.mp4`, 5));
+    if (r.ok) s = r.state;
+  }
+  print("72 clips (boundary, no grouping)", s);
+}
+
+// 9. 73 clips — one over the threshold, grouping kicks in for the first time
+{
+  let s = createProject("Just Over Threshold");
+  for (let i = 1; i <= 73; i++) {
+    const r = addSource(s, mockMedia(`scene-${String(i).padStart(2, "0")}.mp4`, 5));
+    if (r.ok) s = r.state;
+  }
+  print("73 clips (one over threshold, grouping begins)", s);
+}
+
+// 10. 100 clips, uniform 5s each — the original overflow case
+{
+  let s = createProject("100 Uniform Clips");
+  for (let i = 1; i <= 100; i++) {
+    const r = addSource(s, mockMedia(`clip-${String(i).padStart(3, "0")}.mp4`, 5));
+    if (r.ok) s = r.state;
+  }
+  print("100 uniform clips (5s each)", s);
+}
+
+// 11. 100 clips — one very long + 99 short (stress test group boundary arithmetic)
+{
+  let s = createProject("100 Unequal Clips");
+  let r = addSource(s, mockMedia("feature.mp4", 3600));
+  if (r.ok) s = r.state;
+  for (let i = 1; i <= 99; i++) {
+    r = addSource(s, mockMedia(`broll-${i}.mp4`, 2));
+    if (r.ok) s = r.state;
+  }
+  print("100 unequal clips (1×3600s + 99×2s)", s);
+}
+
+// 12. 200 clips — 2× original failing count
+{
+  let s = createProject("200 Clips");
+  for (let i = 1; i <= 200; i++) {
+    const r = addSource(s, mockMedia(`take-${i}.mp4`, 3));
+    if (r.ok) s = r.state;
+  }
+  print("200 clips (3s each)", s);
+}
+
 console.log();

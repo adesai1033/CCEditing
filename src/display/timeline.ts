@@ -14,6 +14,26 @@ const TIME_INTERVALS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600];
 
 const LABEL_WIDTH = 6; // assumed chars per time marker label for spacing
 
+// ── Interfaces ────────────────────────────────────────────────────────────────
+
+interface HasDuration {
+  duration: number;
+}
+
+/**
+ * A visual group represents 1+ consecutive clips merged together for display.
+ * When clips.length <= barWidth, each clip is its own group (identical to
+ * pre-grouping behavior). When clips.length > barWidth, consecutive clips are
+ * merged so the bar never exceeds barWidth segments.
+ */
+interface VisualGroup {
+  clips: Clip[];
+  totalDuration: number;
+  duration: number;      // === totalDuration; satisfies HasDuration
+  label: string;         // clip.label if 1 clip, else `${n} clips`
+  colorIndex: number;    // original timeline index of the first clip in group
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 const stripAnsi = (s: string) => s.replace(/\x1B\[[0-9;]*m/g, "");
@@ -52,25 +72,74 @@ function truncateLabel(label: string, width: number): string {
 }
 
 /**
- * Assign character widths to clips proportionally.
- * Every clip gets at least 1 character. Extra space distributed to largest clips.
+ * Merge consecutive clips into at most maxGroups visual groups, proportional
+ * to duration. When clips.length <= maxGroups, each clip is its own group.
  */
-function assignWidths(clips: Clip[], barWidth: number): number[] {
-  const total = clips.reduce((sum, c) => sum + clipDuration(c), 0);
-  if (total === 0 || clips.length === 0) return clips.map(() => 1);
+function groupClips(clips: Clip[], maxGroups: number): VisualGroup[] {
+  if (maxGroups <= 0) {
+    // Degenerate case — return a single group of everything
+    const total = clips.reduce((sum, c) => sum + clipDuration(c), 0);
+    return [{ clips, totalDuration: total, duration: total, label: `${clips.length} clips`, colorIndex: 0 }];
+  }
 
-  // If there are more clips than bar characters, every clip gets 1 char.
-  // The bar will slightly overflow the box but won't crash.
-  if (clips.length >= barWidth) return clips.map(() => 1);
+  const totalDuration = clips.reduce((sum, c) => sum + clipDuration(c), 0);
+  const targetDuration = totalDuration / maxGroups;
 
-  // Give each clip its proportional share, floored to at least 1
-  const raw = clips.map((c) => Math.max(1, Math.floor((clipDuration(c) / total) * barWidth)));
+  const makeGroup = (clipsSlice: Clip[], colorIndex: number): VisualGroup => {
+    const dur = clipsSlice.reduce((sum, c) => sum + clipDuration(c), 0);
+    return {
+      clips: clipsSlice,
+      totalDuration: dur,
+      duration: dur,
+      label: clipsSlice.length === 1 ? clipsSlice[0]!.label : `${clipsSlice.length} clips`,
+      colorIndex,
+    };
+  };
+
+  const groups: VisualGroup[] = [];
+  let currentClips: Clip[] = [];
+  let currentDuration = 0;
+  let groupColorIndex = 0;
+
+  for (let i = 0; i < clips.length; i++) {
+    const clip = clips[i]!;
+    currentClips.push(clip);
+    currentDuration += clipDuration(clip);
+
+    // Seal when we've hit the target — but always leave room for a final group
+    if (currentDuration >= targetDuration && groups.length < maxGroups - 1) {
+      groups.push(makeGroup(currentClips, groupColorIndex));
+      currentClips = [];
+      currentDuration = 0;
+      groupColorIndex = i + 1;
+    }
+  }
+
+  // Flush remaining clips into the final group
+  if (currentClips.length > 0) {
+    groups.push(makeGroup(currentClips, groupColorIndex));
+  }
+
+  return groups;
+}
+
+/**
+ * Assign character widths to items proportionally.
+ * Every item gets at least 1 character. Extra space distributed by largest
+ * fractional remainder.
+ */
+function assignWidths(items: HasDuration[], barWidth: number): number[] {
+  const total = items.reduce((sum, c) => sum + c.duration, 0);
+  if (total === 0 || items.length === 0) return items.map(() => 1);
+
+  // Give each item its proportional share, floored to at least 1
+  const raw = items.map((c) => Math.max(1, Math.floor((c.duration / total) * barWidth)));
   let used = raw.reduce((a, b) => a + b, 0);
 
-  // Distribute any remaining chars to the clips with the most leftover fractional parts
-  const fractions = clips.map((c, i) => ({
+  // Distribute remaining chars to items with the largest fractional remainders
+  const fractions = items.map((c, i) => ({
     i,
-    frac: (clipDuration(c) / total) * barWidth - raw[i]!,
+    frac: (c.duration / total) * barWidth - raw[i]!,
   }));
   fractions.sort((a, b) => b.frac - a.frac);
 
@@ -81,7 +150,7 @@ function assignWidths(clips: Clip[], barWidth: number): number[] {
     idx++;
   }
 
-  // If we overshoot, trim from largest clips (skipping any at minimum width 1)
+  // If we overshoot, trim from largest items (never below 1)
   let trimIdx = 0;
   const bySize = raw.map((w, i) => ({ i, w })).sort((a, b) => b.w - a.w);
   while (used > barWidth) {
@@ -111,9 +180,9 @@ function chooseInterval(totalSeconds: number, barWidth: number): number {
 export function renderTimeline(state: ProjectState, terminalWidth?: number): string {
   const tWidth = Math.max(20, terminalWidth ?? process.stdout.columns ?? 80);
 
-  // Outer box: "  │ " + content + " │" = 6 chars of overhead (2 indent + 1 border + 1 space + 1 space + 1 border)
+  // Outer box: "  │ " + content + " │" = 6 chars of overhead
   const innerWidth = tWidth - 6;
-  const barWidth   = Math.max(4, innerWidth - 2); // 2 for inner padding each side
+  const barWidth   = Math.max(4, innerWidth - 2);
 
   const box = {
     top:    `  ┌${"─".repeat(innerWidth + 2)}┐`,
@@ -129,34 +198,25 @@ export function renderTimeline(state: ProjectState, terminalWidth?: number): str
 
   // ── Empty state ──────────────────────────────────────────────────────────────
   if (clips.length === 0) {
-    return [
-      box.top,
-      box.row(chalk.dim("No clips on timeline")),
-      box.bottom,
-    ].join("\n");
+    return [box.top, box.row(chalk.dim("No clips on timeline")), box.bottom].join("\n");
   }
 
   const totalDuration = clips.reduce((sum, c) => sum + clipDuration(c), 0);
 
-  // ── Empty state (zero-duration clips) ────────────────────────────────────────
   if (totalDuration === 0) {
-    return [
-      box.top,
-      box.row(chalk.dim("No clips on timeline")),
-      box.bottom,
-    ].join("\n");
+    return [box.top, box.row(chalk.dim("No clips on timeline")), box.bottom].join("\n");
   }
 
-  const widths = assignWidths(clips, barWidth);
+  // ── Group clips so bar never exceeds barWidth segments ───────────────────────
+  const groups = groupClips(clips, barWidth);
+  const widths = assignWidths(groups, barWidth);
 
   // ── Time ruler ───────────────────────────────────────────────────────────────
   const interval = chooseInterval(totalDuration, barWidth);
 
-  // Build ruler as a fixed-width char array
-  const rulerChars  = Array<string>(barWidth).fill(" ");
-  const tickChars   = Array<string>(barWidth).fill(" ");
+  const rulerChars = Array<string>(barWidth).fill(" ");
+  const tickChars  = Array<string>(barWidth).fill(" ");
 
-  // Position 0 always gets a marker
   const markerSeconds: number[] = [];
   for (let t = 0; t <= totalDuration; t += interval) {
     markerSeconds.push(t);
@@ -167,13 +227,12 @@ export function renderTimeline(state: ProjectState, terminalWidth?: number): str
     const pos = Math.round((t / totalDuration) * (barWidth - 1));
     const label = formatMarker(t);
     const start = Math.min(pos, barWidth - label.length);
-    // Place tick regardless, but skip label if it would overlap the previous one
     if (pos < barWidth) tickChars[pos] = "┬";
     if (start < nextFreePos) continue;
     for (let i = 0; i < label.length; i++) {
       if (start + i < barWidth) rulerChars[start + i] = label[i]!;
     }
-    nextFreePos = start + label.length + 1; // +1 minimum gap between labels
+    nextFreePos = start + label.length + 1;
   }
 
   const rulerLine = chalk.dim(rulerChars.join(""));
@@ -181,9 +240,9 @@ export function renderTimeline(state: ProjectState, terminalWidth?: number): str
 
   // ── Clip bar ─────────────────────────────────────────────────────────────────
   let clipBar = "";
-  clips.forEach((clip, idx) => {
+  groups.forEach((group, idx) => {
     const w = widths[idx]!;
-    const color = CLIP_COLORS[idx % CLIP_COLORS.length]!;
+    const color = CLIP_COLORS[group.colorIndex % CLIP_COLORS.length]!;
     const border = color("│");
 
     if (w === 1) {
@@ -191,20 +250,19 @@ export function renderTimeline(state: ProjectState, terminalWidth?: number): str
       return;
     }
 
-    const interior = w - 1; // left border consumed, right border is next clip's left
-    const label = truncateLabel(clip.label, interior - 1); // -1 for leading space
+    const interior = w - 1;
+    const label = truncateLabel(group.label, interior - 1);
     const fill = "─".repeat(Math.max(0, interior - 1 - label.length));
     clipBar += border + color(` ${label}${fill}`);
   });
-  // Close final clip
-  const lastColor = CLIP_COLORS[(clips.length - 1) % CLIP_COLORS.length]!;
-  clipBar += lastColor("│");
+  // Close final group
+  const lastGroup = groups[groups.length - 1]!;
+  clipBar += CLIP_COLORS[lastGroup.colorIndex % CLIP_COLORS.length]!("│");
 
-  // ── Bottom bar border ─────────────────────────────────────────────────────────
-  // Width must match the clip bar: sum(widths) + 1 final border = barWidth + 1
+  // ── Bottom bar (width matches clip bar: barWidth + 1) ────────────────────────
   const bottomBar = chalk.dim("└" + "─".repeat(barWidth));
 
-  // ── Summary line ──────────────────────────────────────────────────────────────
+  // ── Summary (always shows true clip count, not group count) ──────────────────
   const summary = chalk.dim(
     `Total: ${formatTotal(totalDuration)}  ·  ${clips.length} clip${clips.length === 1 ? "" : "s"}`
   );
