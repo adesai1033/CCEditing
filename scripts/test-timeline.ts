@@ -6,7 +6,7 @@
  */
 import { createProject } from "../src/project/io.js";
 import { addSource } from "../src/project/mutations.js";
-import { renderTimeline } from "../src/display/timeline.js";
+import { renderTimeline, type ViewportState } from "../src/display/timeline.js";
 import type { MediaInfo } from "../src/media/types.js";
 
 function mockMedia(name: string, duration: number): MediaInfo {
@@ -158,5 +158,43 @@ print("Empty timeline", createProject("Test"));
   }
   print("200 clips (3s each)", s);
 }
+
+// ── Viewport tests ────────────────────────────────────────────────────────────
+
+// Build a 500s timeline (100 × 5s clips) for viewport tests
+let vpState = createProject("Viewport Test");
+for (let i = 1; i <= 100; i++) {
+  const r = addSource(vpState, mockMedia(`clip-${String(i).padStart(3, "0")}.mp4`, 5));
+  if (r.ok) vpState = r.state;
+}
+
+function printVp(label: string, viewport?: ViewportState) {
+  console.log(`\n─── ${label} ${"─".repeat(Math.max(0, 60 - label.length - 5))}`);
+  console.log(renderTimeline(vpState, 80, viewport));
+}
+
+// 13. Default — no viewport (should be identical to 100-clip full view)
+printVp("Viewport: default (no viewport)");
+
+// 14. Zoomed in — first 60s of a 500s timeline
+printVp("Viewport: zoomed in (0s–60s of 500s)", { startTime: 0, viewDuration: 60 });
+
+// 15. Scrolled right — middle 100s
+printVp("Viewport: scrolled (200s–300s)", { startTime: 200, viewDuration: 100 });
+
+// 16. Near end — last 60s (no ▶ off-screen indicator)
+printVp("Viewport: near end (440s–500s)", { startTime: 440, viewDuration: 60 });
+
+// 17. Partial clip at left edge — viewport starts 2s into a clip → ◀ marker
+printVp("Viewport: partial left edge (52s–112s)", { startTime: 52, viewDuration: 60 });
+
+// 18. Partial clip at right edge — viewport ends 2s into a clip → ▶ marker
+printVp("Viewport: partial right edge (0s–57s)", { startTime: 0, viewDuration: 57 });
+
+// 19. Both edges clipped — viewport starts and ends mid-clip
+printVp("Viewport: both edges clipped (52s–107s)", { startTime: 52, viewDuration: 55 });
+
+// 20. Narrow viewport showing only one clip
+printVp("Viewport: single clip visible (25s–30s)", { startTime: 25, viewDuration: 5 });
 
 console.log();
