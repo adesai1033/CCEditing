@@ -9,7 +9,7 @@ import { probeFile } from "../../media/probe.js";
 import { renderMediaInfo, formatFileSize } from "../../display/media-info.js";
 import { renderTimeline } from "../../display/timeline.js";
 import { renderClipList } from "../../display/timeline-clip-list.js";
-import { addSource, trimClip, reorderClip } from "../../project/mutations.js";
+import { addSource, trimClip, reorderClip, splitClip } from "../../project/mutations.js";
 import { loadOrCreateProject, saveProjectToStandardPath } from "../../cli/project-context.js";
 import { parseTime } from "../../utils/time.js";
 import { execute } from "../../engine/engine.js";
@@ -58,6 +58,9 @@ export async function dispatch(
 
     case "move":
       return dispatchMove(args, state);
+
+    case "split":
+      return dispatchSplit(args, state);
 
     case "export":
       return dispatchExport(args, state);
@@ -167,6 +170,40 @@ async function dispatchMove(args: string[], state: ReplState): Promise<DispatchR
 
   return {
     output: `Moved ${clip.label} → position [${args[1]}]`,
+    isError: false,
+    newState: { project: mutation.state },
+  };
+}
+
+// ── /split ────────────────────────────────────────────────────────────────────
+
+async function dispatchSplit(args: string[], state: ReplState): Promise<DispatchResult> {
+  if (!state.project) return { output: "No project open. Use /open first.", isError: true };
+  if (args.length < 2) return { output: "Usage: /split <clip> <time>", isError: true };
+
+  const clip = resolveClip(state.project.timeline, args[0]!);
+  if (!clip) {
+    const count = clipsInOrder(state.project.timeline).length;
+    return { output: `Clip "${args[0]}" not found (1–${count})`, isError: true };
+  }
+
+  let splitPoint: number;
+  try {
+    splitPoint = parseTime(args[1]!);
+  } catch (e) {
+    return { output: `Error: ${(e as Error).message}`, isError: true };
+  }
+
+  const mutation = splitClip(state.project, clip.id, splitPoint);
+  if (!mutation.ok) return { output: `Error: ${mutation.error}`, isError: true };
+
+  const saved = await saveProjectToStandardPath(mutation.state);
+  if (!saved.ok) return { output: `Error saving project: ${saved.error}`, isError: true };
+
+  const ordered = clipsInOrder(mutation.state.timeline);
+  const idx = ordered.findIndex((c) => c.id === clip.id);
+  return {
+    output: `Split ${clip.label} at ${args[1]} → clips [${idx + 1}] and [${idx + 2}]`,
     isError: false,
     newState: { project: mutation.state },
   };

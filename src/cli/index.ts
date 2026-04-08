@@ -10,7 +10,7 @@ import { renderTimeline } from "../display/timeline.js";
 import { renderClipList } from "../display/timeline-clip-list.js";
 import { execute } from "../engine/engine.js";
 import { parseTime } from "../utils/time.js";
-import { addSource, trimClip, reorderClip } from "../project/mutations.js";
+import { addSource, trimClip, reorderClip, splitClip } from "../project/mutations.js";
 import { clipsInOrder, resolveClip } from "../project/types.js";
 import { formatFileSize } from "../display/media-info.js";
 import {
@@ -178,6 +178,60 @@ program
 
     console.log();
     console.log(chalk.green(`Moved clip [${fromStr}] ${clip.label} → position [${toStr}]`));
+    console.log();
+    console.log(renderTimeline(result.state, process.stdout.columns));
+    console.log();
+    console.log(renderClipList(result.state));
+    console.log();
+  });
+
+// ── split ─────────────────────────────────────────────────────────────────────
+
+program
+  .command("split <clip> <time>")
+  .description("Split a clip at a source time into two consecutive clips")
+  .action(async (clipRef: string, timeStr: string) => {
+    const ctx = await loadOrCreateProject();
+    if (!ctx.ok) {
+      console.error(chalk.red(`Error: ${ctx.error}`));
+      process.exit(1);
+    }
+    if (!ctx.existed) {
+      console.error(chalk.red("Error: No project found. Run `cutcli open <file>` first."));
+      process.exit(1);
+    }
+
+    const clip = resolveClip(ctx.state.timeline, clipRef);
+    if (!clip) {
+      const count = clipsInOrder(ctx.state.timeline).length;
+      console.error(chalk.red(`Error: Clip "${clipRef}" not found (project has ${count} clip${count === 1 ? "" : "s"}).`));
+      process.exit(1);
+    }
+
+    let splitPoint: number;
+    try {
+      splitPoint = parseTime(timeStr);
+    } catch (err: unknown) {
+      console.error(chalk.red(`Error: ${(err as Error).message}`));
+      process.exit(1);
+    }
+
+    const result = splitClip(ctx.state, clip.id, splitPoint);
+    if (!result.ok) {
+      console.error(chalk.red(`Error: ${result.error}`));
+      process.exit(1);
+    }
+
+    const saved = await saveProjectToStandardPath(result.state);
+    if (!saved.ok) {
+      console.error(chalk.red(`Error saving project: ${saved.error}`));
+      process.exit(1);
+    }
+
+    const ordered = clipsInOrder(result.state.timeline);
+    const idx = ordered.findIndex((c) => c.id === clip.id);
+    console.log();
+    console.log(chalk.green(`Split ${clip.label} at ${timeStr} → clips [${idx + 1}] and [${idx + 2}]`));
     console.log();
     console.log(renderTimeline(result.state, process.stdout.columns));
     console.log();

@@ -1,6 +1,6 @@
 import chalk from "chalk";
 import type { ProjectState } from "../project/types.js";
-import { clipsInOrder } from "../project/types.js";
+import { clipsInOrder, getClipDisplayRefs } from "../project/types.js";
 
 function formatDuration(seconds: number): string {
   const h = Math.floor(seconds / 3600);
@@ -26,16 +26,18 @@ export function renderClipList(state: ProjectState): string {
   const ordered = clipsInOrder(state.timeline);
   if (ordered.length === 0) return "";
 
-  const sourceMap = new Map(state.sources.map((s) => [s.id, s]));
+  const sourceMap  = new Map(state.sources.map((s) => [s.id, s]));
+  const displayRefs = getClipDisplayRefs(state.timeline);
 
-  const lines = ordered.map((clip, i) => {
-    const source = sourceMap.get(clip.sourceId);
-    const name = clip.label !== source?.fileName ? clip.label : (source?.fileName ?? clip.sourceId);
+  const lines = ordered.map((clip) => {
+    const source   = sourceMap.get(clip.sourceId);
+    const name     = clip.label !== source?.fileName ? clip.label : (source?.fileName ?? clip.sourceId);
     const duration = clip.outPoint - clip.inPoint;
-    const index = chalk.dim(`[${i + 1}]`);
-    const nameStr = chalk.white(name.padEnd(24));
-    const range = chalk.dim(`${formatDuration(clip.inPoint)} → ${formatDuration(clip.outPoint)}`);
-    const dur = chalk.dim(`(${formatSeconds(duration)})`);
+    const ref      = displayRefs.get(clip.id) ?? "?";
+    const index    = chalk.dim(`[${ref}]`);
+    const nameStr  = chalk.white(name.padEnd(24));
+    const range    = chalk.dim(`${formatDuration(clip.inPoint)} → ${formatDuration(clip.outPoint)}`);
+    const dur      = chalk.dim(`(${formatSeconds(duration)})`);
     return `  ${index} ${nameStr} ${range}  ${dur}`;
   });
 

@@ -108,7 +108,7 @@ function migrateArrayTimeline(
     const old = oldClips[i]!;
     const prevId = i > 0 ? oldClips[i - 1]!.id : null;
     const nextId = i < oldClips.length - 1 ? oldClips[i + 1]!.id : null;
-    clips[old.id] = { ...old, prevId, nextId };
+    clips[old.id] = { ...old, prevId, nextId, splitGroupId: null };
     if (i === 0) headId = old.id;
     if (i === oldClips.length - 1) tailId = old.id;
   }

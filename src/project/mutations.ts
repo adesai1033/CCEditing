@@ -51,6 +51,7 @@ export function addSource(state: ProjectState, mediaInfo: MediaInfo): MutationRe
     label: source.fileName,
     prevId: state.timeline.tailId,
     nextId: null,
+    splitGroupId: null,
   };
 
   let clips = setClip(state.timeline.clips, clip);
@@ -204,6 +205,68 @@ export function reorderClip(
     state: touch({
       ...state,
       timeline: { headId, tailId, clips },
+    }),
+  };
+}
+
+/**
+ * Split a clip at a source-time split point into two consecutive clips.
+ * The original clip is shortened to [inPoint, splitPoint]; a new clip covering
+ * [splitPoint, outPoint] is inserted immediately after it in O(1).
+ * splitPoint must be strictly between the clip's inPoint and outPoint.
+ */
+export function splitClip(
+  state: ProjectState,
+  clipId: string,
+  splitPoint: number
+): MutationResult {
+  const clip = findClip(state, clipId);
+  if (!clip) return { ok: false, error: `Clip not found: ${clipId}` };
+
+  if (splitPoint < 0) {
+    return { ok: false, error: `Split point cannot be negative` };
+  }
+  if (splitPoint <= clip.inPoint) {
+    return { ok: false, error: `Split point (${splitPoint}s) must be after clip in-point (${clip.inPoint}s)` };
+  }
+  if (splitPoint >= clip.outPoint) {
+    return { ok: false, error: `Split point (${splitPoint}s) must be before clip out-point (${clip.outPoint}s)` };
+  }
+
+  // All siblings from the same original clip share a splitGroupId so the
+  // display layer can render them as 2a/2b/2c without shifting other indices.
+  const groupId = clip.splitGroupId ?? crypto.randomUUID();
+  const newId = crypto.randomUUID();
+
+  const second: Clip = {
+    id: newId,
+    sourceId: clip.sourceId,
+    inPoint: splitPoint,
+    outPoint: clip.outPoint,
+    label: clip.label,
+    prevId: clip.id,
+    nextId: clip.nextId,
+    splitGroupId: groupId,
+  };
+
+  // Shorten original clip, assign its groupId, and wire it to the new second clip
+  let clips = setClip(state.timeline.clips, { ...clip, outPoint: splitPoint, nextId: newId, splitGroupId: groupId });
+  clips = setClip(clips, second);
+
+  // The clip that came after the original now follows the second clip
+  if (clip.nextId) {
+    clips = setClip(clips, { ...clips[clip.nextId]!, prevId: newId });
+  }
+
+  return {
+    ok: true,
+    state: touch({
+      ...state,
+      timeline: {
+        headId: state.timeline.headId,
+        tailId: state.timeline.tailId === clipId ? newId : state.timeline.tailId,
+        clips,
+      },
     }),
   };
 }
