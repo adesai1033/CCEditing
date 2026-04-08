@@ -1,6 +1,6 @@
-import type { ProjectState, SourceFile, Clip, MutationResult } from "./types.js";
+import type { ProjectState, SourceFile, Clip, Timeline, MutationResult } from "./types.js";
+import { clipsInOrder, sourceFileFromMediaInfo } from "./types.js";
 import type { MediaInfo } from "../media/types.js";
-import { sourceFileFromMediaInfo } from "./types.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -13,37 +13,64 @@ function touch(state: ProjectState): ProjectState {
 }
 
 function findClip(state: ProjectState, clipId: string): Clip | undefined {
-  return state.timeline.clips.find((c) => c.id === clipId);
+  return state.timeline.clips[clipId];
 }
 
 function findSource(state: ProjectState, sourceId: string): SourceFile | undefined {
   return state.sources.find((s) => s.id === sourceId);
 }
 
+// Return a new clips record with one entry replaced/added.
+function setClip(clips: Record<string, Clip>, clip: Clip): Record<string, Clip> {
+  return { ...clips, [clip.id]: clip };
+}
+
+// Remove a clip entry from the record immutably.
+function deleteClip(clips: Record<string, Clip>, clipId: string): Record<string, Clip> {
+  const next = { ...clips };
+  delete next[clipId];
+  return next;
+}
+
 // ── Mutations ─────────────────────────────────────────────────────────────────
 
 /**
  * Import a source file into the project.
- * Creates a SourceFile from MediaInfo, adds it to sources, and places a clip
- * covering the full duration at the end of the timeline.
+ * Creates a SourceFile from MediaInfo and appends a full-duration clip to the
+ * tail of the timeline in O(1).
  */
 export function addSource(state: ProjectState, mediaInfo: MediaInfo): MutationResult {
   const source = sourceFileFromMediaInfo(mediaInfo);
+  const clipId = crypto.randomUUID();
 
   const clip: Clip = {
-    id: crypto.randomUUID(),
+    id: clipId,
     sourceId: source.id,
     inPoint: 0,
     outPoint: source.duration,
     label: source.fileName,
+    prevId: state.timeline.tailId,
+    nextId: null,
   };
+
+  let clips = setClip(state.timeline.clips, clip);
+
+  // Wire the old tail to point forward to the new clip
+  if (state.timeline.tailId) {
+    const oldTail = clips[state.timeline.tailId]!;
+    clips = setClip(clips, { ...oldTail, nextId: clipId });
+  }
 
   return {
     ok: true,
     state: touch({
       ...state,
       sources: [...state.sources, source],
-      timeline: { clips: [...state.timeline.clips, clip] },
+      timeline: {
+        headId: state.timeline.headId ?? clipId,
+        tailId: clipId,
+        clips,
+      },
     }),
   };
 }
@@ -75,13 +102,13 @@ export function trimClip(
     return { ok: false, error: `In-point (${inPoint}s) must be before out-point (${outPoint}s)` };
   }
 
-  const updatedClip: Clip = { ...clip, inPoint, outPoint };
   return {
     ok: true,
     state: touch({
       ...state,
       timeline: {
-        clips: state.timeline.clips.map((c) => (c.id === clipId ? updatedClip : c)),
+        ...state.timeline,
+        clips: setClip(state.timeline.clips, { ...clip, inPoint, outPoint }),
       },
     }),
   };
@@ -89,47 +116,94 @@ export function trimClip(
 
 /**
  * Remove a clip from the timeline. The source file is kept.
+ * Rewires neighbours in O(1).
  */
 export function removeClip(state: ProjectState, clipId: string): MutationResult {
   const clip = findClip(state, clipId);
   if (!clip) return { ok: false, error: `Clip not found: ${clipId}` };
+
+  let clips = deleteClip(state.timeline.clips, clipId);
+
+  if (clip.prevId) {
+    clips = setClip(clips, { ...clips[clip.prevId]!, nextId: clip.nextId });
+  }
+  if (clip.nextId) {
+    clips = setClip(clips, { ...clips[clip.nextId]!, prevId: clip.prevId });
+  }
 
   return {
     ok: true,
     state: touch({
       ...state,
       timeline: {
-        clips: state.timeline.clips.filter((c) => c.id !== clipId),
+        headId: state.timeline.headId === clipId ? clip.nextId : state.timeline.headId,
+        tailId: state.timeline.tailId === clipId ? clip.prevId : state.timeline.tailId,
+        clips,
       },
     }),
   };
 }
 
 /**
- * Move a clip to a new index in the timeline.
+ * Move a clip to a new 0-based index in the timeline.
+ * Removal is O(1); finding the insertion point is O(n).
  */
 export function reorderClip(
   state: ProjectState,
   clipId: string,
   newIndex: number
 ): MutationResult {
-  const clips = state.timeline.clips;
-  const currentIndex = clips.findIndex((c) => c.id === clipId);
+  const ordered = clipsInOrder(state.timeline);
+  const currentIndex = ordered.findIndex((c) => c.id === clipId);
   if (currentIndex === -1) return { ok: false, error: `Clip not found: ${clipId}` };
 
-  if (newIndex < 0 || newIndex >= clips.length) {
-    return { ok: false, error: `Index ${newIndex} out of range (0–${clips.length - 1})` };
+  if (newIndex < 0 || newIndex >= ordered.length) {
+    return { ok: false, error: `Index ${newIndex + 1} out of range (1–${ordered.length})` };
   }
+  if (currentIndex === newIndex) return { ok: true, state };
 
-  const reordered = [...clips];
-  const [moved] = reordered.splice(currentIndex, 1);
-  reordered.splice(newIndex, 0, moved!);
+  const clip = state.timeline.clips[clipId]!;
+
+  // Step 1: detach clip from its current position
+  let clips = deleteClip(state.timeline.clips, clipId);
+  if (clip.prevId) clips = setClip(clips, { ...clips[clip.prevId]!, nextId: clip.nextId });
+  if (clip.nextId) clips = setClip(clips, { ...clips[clip.nextId]!, prevId: clip.prevId });
+
+  let headId = state.timeline.headId === clipId ? clip.nextId : state.timeline.headId;
+  let tailId = state.timeline.tailId === clipId ? clip.prevId : state.timeline.tailId;
+
+  // Step 2: find insertion point in the post-removal order
+  const orderedAfter = ordered.filter((c) => c.id !== clipId);
+
+  if (newIndex === 0) {
+    // Insert before current head
+    if (headId) clips = setClip(clips, { ...clips[headId]!, prevId: clipId });
+    clips = setClip(clips, { ...clip, prevId: null, nextId: headId });
+    headId = clipId;
+    if (tailId === null) tailId = clipId;
+  } else {
+    // Insert after the clip currently sitting at (newIndex - 1) in the
+    // post-removal order. We read nextId from the mutated `clips` record (not
+    // from the stale orderedAfter snapshot) so that we get the already-rewired
+    // pointer in the case where insertAfter was a direct neighbour of the
+    // removed clip and had its nextId updated in the detach step above.
+    const insertAfter = orderedAfter[newIndex - 1]!;
+    const insertAfterNextId = clips[insertAfter.id]!.nextId;
+
+    clips = setClip(clips, { ...clips[insertAfter.id]!, nextId: clipId });
+    if (insertAfterNextId) {
+      clips = setClip(clips, { ...clips[insertAfterNextId]!, prevId: clipId });
+    }
+    clips = setClip(clips, { ...clip, prevId: insertAfter.id, nextId: insertAfterNextId });
+
+    if (insertAfterNextId === null) tailId = clipId;
+  }
 
   return {
     ok: true,
     state: touch({
       ...state,
-      timeline: { clips: reordered },
+      timeline: { headId, tailId, clips },
     }),
   };
 }
@@ -152,9 +226,8 @@ export function renameClip(
     state: touch({
       ...state,
       timeline: {
-        clips: state.timeline.clips.map((c) =>
-          c.id === clipId ? { ...c, label: label.trim() } : c
-        ),
+        ...state.timeline,
+        clips: setClip(state.timeline.clips, { ...clip, label: label.trim() }),
       },
     }),
   };
@@ -167,14 +240,23 @@ export function removeSource(state: ProjectState, sourceId: string): MutationRes
   const source = findSource(state, sourceId);
   if (!source) return { ok: false, error: `Source not found: ${sourceId}` };
 
+  // Remove all clips referencing this source, in order, reusing removeClip logic
+  const toRemove = clipsInOrder(state.timeline)
+    .filter((c) => c.sourceId === sourceId)
+    .map((c) => c.id);
+
+  let current = state;
+  for (const id of toRemove) {
+    const result = removeClip(current, id);
+    if (!result.ok) return result;
+    current = result.state;
+  }
+
   return {
     ok: true,
     state: touch({
-      ...state,
-      sources: state.sources.filter((s) => s.id !== sourceId),
-      timeline: {
-        clips: state.timeline.clips.filter((c) => c.sourceId !== sourceId),
-      },
+      ...current,
+      sources: current.sources.filter((s) => s.id !== sourceId),
     }),
   };
 }

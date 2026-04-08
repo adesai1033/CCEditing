@@ -10,7 +10,8 @@ import { renderTimeline } from "../display/timeline.js";
 import { renderClipList } from "../display/timeline-clip-list.js";
 import { execute } from "../engine/engine.js";
 import { parseTime } from "../utils/time.js";
-import { addSource, trimClip } from "../project/mutations.js";
+import { addSource, trimClip, reorderClip } from "../project/mutations.js";
+import { clipsInOrder, resolveClip } from "../project/types.js";
 import { formatFileSize } from "../display/media-info.js";
 import {
   projectFilePath,
@@ -66,7 +67,7 @@ program
     }
 
     const statusMsg = ctx.existed
-      ? `Added to project  ·  ${chalk.dim(projectFilePath())}  (${result.state.sources.length} sources, ${result.state.timeline.clips.length} clips)`
+      ? `Added to project  ·  ${chalk.dim(projectFilePath())}  (${result.state.sources.length} sources, ${clipsInOrder(result.state.timeline).length} clips)`
       : `Created project  ·  ${chalk.dim(projectFilePath())}`;
     console.log(chalk.green(statusMsg));
     console.log();
@@ -92,10 +93,10 @@ program
       process.exit(1);
     }
 
-    const index = parseInt(indexStr, 10) - 1; // convert to 0-based
-    const clips = ctx.state.timeline.clips;
-    if (isNaN(index) || index < 0 || index >= clips.length) {
-      console.error(chalk.red(`Error: Clip index ${indexStr} out of range (project has ${clips.length} clip${clips.length === 1 ? "" : "s"}).`));
+    const clip = resolveClip(ctx.state.timeline, indexStr);
+    if (!clip) {
+      const count = clipsInOrder(ctx.state.timeline).length;
+      console.error(chalk.red(`Error: Clip "${indexStr}" not found (project has ${count} clip${count === 1 ? "" : "s"}).`));
       process.exit(1);
     }
 
@@ -109,7 +110,6 @@ program
       process.exit(1);
     }
 
-    const clip = clips[index]!;
     const result = trimClip(ctx.state, clip.id, { inPoint, outPoint });
     if (!result.ok) {
       console.error(chalk.red(`Error: ${result.error}`));
@@ -122,11 +122,62 @@ program
       process.exit(1);
     }
 
-    const trimmedClip = result.state.timeline.clips[index]!;
+    const trimmedClip = result.state.timeline.clips[clip.id]!;
     const duration = trimmedClip.outPoint - trimmedClip.inPoint;
     console.log();
-    console.log(chalk.green(`Trimmed clip [${index + 1}] ${trimmedClip.label}`));
+    console.log(chalk.green(`Trimmed clip ${trimmedClip.label}`));
     console.log(chalk.dim(`  ${startStr} → ${endStr}  (${formatSeconds(duration)})`));
+    console.log();
+    console.log(renderTimeline(result.state, process.stdout.columns));
+    console.log();
+    console.log(renderClipList(result.state));
+    console.log();
+  });
+
+// ── move ──────────────────────────────────────────────────────────────────────
+
+program
+  .command("move <from> <to>")
+  .description("Move a clip to a new position (1-based indices)")
+  .action(async (fromStr: string, toStr: string) => {
+    const ctx = await loadOrCreateProject();
+    if (!ctx.ok) {
+      console.error(chalk.red(`Error: ${ctx.error}`));
+      process.exit(1);
+    }
+    if (!ctx.existed) {
+      console.error(chalk.red("Error: No project found. Run `cutcli open <file>` first."));
+      process.exit(1);
+    }
+
+    const clip = resolveClip(ctx.state.timeline, fromStr);
+    if (!clip) {
+      const count = clipsInOrder(ctx.state.timeline).length;
+      console.error(chalk.red(`Error: Clip "${fromStr}" not found (project has ${count} clip${count === 1 ? "" : "s"}).`));
+      process.exit(1);
+    }
+
+    const toIdx = parseInt(toStr, 10) - 1;
+    const count = clipsInOrder(ctx.state.timeline).length;
+    if (isNaN(toIdx) || toIdx < 0 || toIdx >= count) {
+      console.error(chalk.red(`Error: To-index ${toStr} out of range (project has ${count} clip${count === 1 ? "" : "s"}).`));
+      process.exit(1);
+    }
+
+    const result = reorderClip(ctx.state, clip.id, toIdx);
+    if (!result.ok) {
+      console.error(chalk.red(`Error: ${result.error}`));
+      process.exit(1);
+    }
+
+    const saved = await saveProjectToStandardPath(result.state);
+    if (!saved.ok) {
+      console.error(chalk.red(`Error saving project: ${saved.error}`));
+      process.exit(1);
+    }
+
+    console.log();
+    console.log(chalk.green(`Moved clip [${fromStr}] ${clip.label} → position [${toStr}]`));
     console.log();
     console.log(renderTimeline(result.state, process.stdout.columns));
     console.log();
@@ -151,7 +202,7 @@ program
     }
 
     const { state } = ctx;
-    const clips = state.timeline.clips;
+    const clips = clipsInOrder(state.timeline);
 
     if (clips.length === 0) {
       console.error(chalk.red("Error: Timeline is empty. Add clips with `cutcli open <file>`."));

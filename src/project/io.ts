@@ -1,6 +1,6 @@
 import { readFile, writeFile, access } from "node:fs/promises";
 import { constants } from "node:fs";
-import type { ProjectState, SourceFile } from "./types.js";
+import type { ProjectState, SourceFile, Clip, Timeline } from "./types.js";
 
 const SUPPORTED_VERSION = 1;
 
@@ -14,7 +14,7 @@ export function createProject(name: string): ProjectState {
     createdAt: ts,
     updatedAt: ts,
     sources: [],
-    timeline: { clips: [] },
+    timeline: { headId: null, tailId: null, clips: {} },
   };
 }
 
@@ -58,18 +58,63 @@ export async function loadProject(filePath: string): Promise<ProjectState> {
       `Unsupported project version ${state["version"]} (expected ${SUPPORTED_VERSION})`
     );
   }
-
   if (typeof state["name"] !== "string") {
     throw new Error(`Project file is missing required field "name": ${filePath}`);
   }
   if (!Array.isArray(state["sources"])) {
     throw new Error(`Project file is missing required field "sources": ${filePath}`);
   }
-  if (typeof state["timeline"] !== "object" || state["timeline"] === null || !Array.isArray((state["timeline"] as Record<string, unknown>)["clips"])) {
-    throw new Error(`Project file is missing required field "timeline.clips": ${filePath}`);
+
+  const timeline = state["timeline"] as Record<string, unknown> | undefined;
+  if (typeof timeline !== "object" || timeline === null) {
+    throw new Error(`Project file is missing required field "timeline": ${filePath}`);
+  }
+
+  // Migrate old array-based format to linked list
+  if (Array.isArray(timeline["clips"])) {
+    return migrateArrayTimeline(state, timeline["clips"] as OldClip[]);
+  }
+
+  if (typeof timeline["clips"] !== "object" || timeline["clips"] === null || Array.isArray(timeline["clips"])) {
+    throw new Error(`Project file has invalid timeline.clips: ${filePath}`);
+  }
+  if (!("headId" in timeline) || !("tailId" in timeline)) {
+    throw new Error(`Project file is missing timeline.headId/tailId: ${filePath}`);
   }
 
   return parsed as ProjectState;
+}
+
+// ── Migration ─────────────────────────────────────────────────────────────────
+
+// Shape of a clip in the old array-based format (no prevId/nextId)
+interface OldClip {
+  id: string;
+  sourceId: string;
+  inPoint: number;
+  outPoint: number;
+  label: string;
+}
+
+function migrateArrayTimeline(
+  state: Record<string, unknown>,
+  oldClips: OldClip[]
+): ProjectState {
+  const clips: Record<string, Clip> = {};
+  let headId: string | null = null;
+  let tailId: string | null = null;
+
+  for (let i = 0; i < oldClips.length; i++) {
+    const old = oldClips[i]!;
+    const prevId = i > 0 ? oldClips[i - 1]!.id : null;
+    const nextId = i < oldClips.length - 1 ? oldClips[i + 1]!.id : null;
+    clips[old.id] = { ...old, prevId, nextId };
+    if (i === 0) headId = old.id;
+    if (i === oldClips.length - 1) tailId = old.id;
+  }
+
+  const timeline: Timeline = { headId, tailId, clips };
+  return { ...(state as unknown as ProjectState), timeline };
 }
 
 // ── Source validation ─────────────────────────────────────────────────────────

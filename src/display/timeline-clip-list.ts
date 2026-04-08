@@ -1,5 +1,6 @@
 import chalk from "chalk";
 import type { ProjectState } from "../project/types.js";
+import { clipsInOrder } from "../project/types.js";
 
 function formatDuration(seconds: number): string {
   const h = Math.floor(seconds / 3600);
@@ -22,11 +23,12 @@ function formatSeconds(seconds: number): string {
 
 /** Renders a numbered list of clips with in/out points and duration. */
 export function renderClipList(state: ProjectState): string {
-  if (state.timeline.clips.length === 0) return "";
+  const ordered = clipsInOrder(state.timeline);
+  if (ordered.length === 0) return "";
 
   const sourceMap = new Map(state.sources.map((s) => [s.id, s]));
 
-  const lines = state.timeline.clips.map((clip, i) => {
+  const lines = ordered.map((clip, i) => {
     const source = sourceMap.get(clip.sourceId);
     const name = clip.label !== source?.fileName ? clip.label : (source?.fileName ?? clip.sourceId);
     const duration = clip.outPoint - clip.inPoint;

@@ -2,13 +2,14 @@ import path from "node:path";
 import os from "node:os";
 import { mkdir, unlink } from "node:fs/promises";
 import type { ProjectState } from "../../project/types.js";
+import { clipsInOrder, resolveClip } from "../../project/types.js";
 import type { ViewportState } from "../../display/timeline.js";
 import { buildHelpText } from "./registry.js";
 import { probeFile } from "../../media/probe.js";
 import { renderMediaInfo, formatFileSize } from "../../display/media-info.js";
 import { renderTimeline } from "../../display/timeline.js";
 import { renderClipList } from "../../display/timeline-clip-list.js";
-import { addSource, trimClip } from "../../project/mutations.js";
+import { addSource, trimClip, reorderClip } from "../../project/mutations.js";
 import { loadOrCreateProject, saveProjectToStandardPath } from "../../cli/project-context.js";
 import { parseTime } from "../../utils/time.js";
 import { execute } from "../../engine/engine.js";
@@ -55,6 +56,9 @@ export async function dispatch(
     case "trim":
       return dispatchTrim(args, state);
 
+    case "move":
+      return dispatchMove(args, state);
+
     case "export":
       return dispatchExport(args, state);
 
@@ -84,7 +88,7 @@ async function dispatchOpen(args: string[], state: ReplState): Promise<DispatchR
   const saved = await saveProjectToStandardPath(mutation.state);
   if (!saved.ok) return { output: `Error saving project: ${saved.error}`, isError: true };
 
-  const clipCount = mutation.state.timeline.clips.length;
+  const clipCount = clipsInOrder(mutation.state.timeline).length;
   return {
     output: renderMediaInfo(probe.data) + `\n\nAdded to project  ·  ${clipCount} clip${clipCount === 1 ? "" : "s"}`,
     isError: false,
@@ -95,7 +99,7 @@ async function dispatchOpen(args: string[], state: ReplState): Promise<DispatchR
 // ── /timeline ─────────────────────────────────────────────────────────────────
 
 function dispatchTimeline(state: ReplState, viewport?: ViewportState): DispatchResult {
-  if (!state.project || state.project.timeline.clips.length === 0) {
+  if (!state.project || state.project.timeline.headId === null) {
     return { output: "No clips on timeline. Use /open to add a file.", isError: true };
   }
   const rendered = renderTimeline(state.project, process.stdout.columns, viewport)
@@ -109,10 +113,10 @@ async function dispatchTrim(args: string[], state: ReplState): Promise<DispatchR
   if (!state.project) return { output: "No project open. Use /open first.", isError: true };
   if (args.length < 3) return { output: "Usage: /trim <index> <start> <end>", isError: true };
 
-  const idx = parseInt(args[0]!, 10) - 1;
-  const clips = state.project.timeline.clips;
-  if (isNaN(idx) || idx < 0 || idx >= clips.length) {
-    return { output: `Clip index ${args[0]} out of range (1–${clips.length})`, isError: true };
+  const clip = resolveClip(state.project.timeline, args[0]!);
+  if (!clip) {
+    const count = clipsInOrder(state.project.timeline).length;
+    return { output: `Clip "${args[0]}" not found (1–${count})`, isError: true };
   }
 
   let inPoint: number, outPoint: number;
@@ -123,15 +127,46 @@ async function dispatchTrim(args: string[], state: ReplState): Promise<DispatchR
     return { output: `Error: ${(e as Error).message}`, isError: true };
   }
 
-  const mutation = trimClip(state.project, clips[idx]!.id, { inPoint, outPoint });
+  const mutation = trimClip(state.project, clip.id, { inPoint, outPoint });
   if (!mutation.ok) return { output: `Error: ${mutation.error}`, isError: true };
 
   const saved = await saveProjectToStandardPath(mutation.state);
   if (!saved.ok) return { output: `Error saving project: ${saved.error}`, isError: true };
 
-  const clip = mutation.state.timeline.clips[idx]!;
+  const trimmed = mutation.state.timeline.clips[clip.id]!;
   return {
-    output: `Trimmed [${idx + 1}] ${clip.label}  ${args[1]} → ${args[2]}  (${formatSeconds(clip.outPoint - clip.inPoint)})`,
+    output: `Trimmed ${trimmed.label}  ${args[1]} → ${args[2]}  (${formatSeconds(trimmed.outPoint - trimmed.inPoint)})`,
+    isError: false,
+    newState: { project: mutation.state },
+  };
+}
+
+// ── /move ─────────────────────────────────────────────────────────────────────
+
+async function dispatchMove(args: string[], state: ReplState): Promise<DispatchResult> {
+  if (!state.project) return { output: "No project open. Use /open first.", isError: true };
+  if (args.length < 2) return { output: "Usage: /move <from> <to>", isError: true };
+
+  const clip = resolveClip(state.project.timeline, args[0]!);
+  if (!clip) {
+    const count = clipsInOrder(state.project.timeline).length;
+    return { output: `Clip "${args[0]}" not found (1–${count})`, isError: true };
+  }
+
+  const toIdx = parseInt(args[1]!, 10) - 1;
+  const count = clipsInOrder(state.project.timeline).length;
+  if (isNaN(toIdx) || toIdx < 0 || toIdx >= count) {
+    return { output: `To-index ${args[1]} out of range (1–${count})`, isError: true };
+  }
+
+  const mutation = reorderClip(state.project, clip.id, toIdx);
+  if (!mutation.ok) return { output: `Error: ${mutation.error}`, isError: true };
+
+  const saved = await saveProjectToStandardPath(mutation.state);
+  if (!saved.ok) return { output: `Error saving project: ${saved.error}`, isError: true };
+
+  return {
+    output: `Moved ${clip.label} → position [${args[1]}]`,
     isError: false,
     newState: { project: mutation.state },
   };
@@ -143,7 +178,7 @@ async function dispatchExport(args: string[], state: ReplState): Promise<Dispatc
   if (!state.project) return { output: "No project open. Use /open first.", isError: true };
   if (!args[0]) return { output: "Usage: /export <output-file>", isError: true };
 
-  const clips = state.project.timeline.clips;
+  const clips = clipsInOrder(state.project.timeline);
   if (clips.length === 0) return { output: "Timeline is empty. Use /open to add clips.", isError: true };
 
   const outputPath = path.resolve(args[0]);

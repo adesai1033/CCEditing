@@ -8,6 +8,7 @@ import { dispatch, type ReplState } from "./commands/dispatch.js";
 import { renderTimeline, type ViewportState } from "../display/timeline.js";
 import { renderClipList } from "../display/timeline-clip-list.js";
 import { loadOrCreateProject } from "../cli/project-context.js";
+import { clipsInOrder } from "../project/types.js";
 
 export function App() {
   const [entries, setEntries]               = useState<HistoryEntry[]>([]);
@@ -33,7 +34,7 @@ export function App() {
       setPendingEntry(null);
       if (ctx.ok && ctx.existed) {
         setReplState({ project: ctx.state });
-        const clipCount = ctx.state.timeline.clips.length;
+        const clipCount = clipsInOrder(ctx.state.timeline).length;
         setEntries([{
           id,
           input: "(startup)",
@@ -75,7 +76,7 @@ export function App() {
 
   function totalDuration(state: ReplState): number {
     if (!state.project) return 0;
-    return state.project.timeline.clips.reduce((s, c) => s + (c.outPoint - c.inPoint), 0);
+    return clipsInOrder(state.project.timeline).reduce((s, c) => s + (c.outPoint - c.inPoint), 0);
   }
 
   function handleViewportZoom(dir: "in" | "out"): void {

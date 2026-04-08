@@ -1,5 +1,6 @@
 import chalk from "chalk";
 import type { ProjectState, Clip } from "../project/types.js";
+import { clipsInOrder } from "../project/types.js";
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -290,7 +291,7 @@ export function renderTimeline(
     },
   };
 
-  const clips = state.timeline.clips;
+  const clips = clipsInOrder(state.timeline);
 
   if (clips.length === 0) {
     return [box.top, box.row(chalk.dim("No clips on timeline")), box.bottom].join("\n");
