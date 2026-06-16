@@ -10,9 +10,8 @@ import { renderTimeline } from "../display/timeline.js";
 import { renderClipList } from "../display/timeline-clip-list.js";
 import { execute } from "../engine/engine.js";
 import { parseTime } from "../utils/time.js";
-import { addSource, trimClip, reorderClip, splitClip, removeClip } from "../project/mutations.js";
 import { clipsInOrder, resolveClip, getClipDisplayRefs } from "../project/types.js";
-import { applyMutation, undoSession, redoSession, type ProjectSession } from "../project/session.js";
+import { applyPlan, undoSession, redoSession, type ProjectSession } from "../project/session.js";
 import { formatFileSize } from "../display/media-info.js";
 import {
   projectFilePath,
@@ -51,10 +50,10 @@ program
       process.exit(1);
     }
 
-    const result = applyMutation(
+    const result = applyPlan(
       ctx.session,
       `add source ${probe.data.fileName}`,
-      (s) => addSource(s, probe.data),
+      [{ type: "addSource", mediaInfo: probe.data }],
     );
     if (!result.ok) {
       console.error(chalk.red(`Error: ${result.error}`));
@@ -100,10 +99,10 @@ program
     }
 
     const ref = getClipDisplayRefs(session.state.timeline).get(clip.id) ?? indexStr;
-    const result = applyMutation(
+    const result = applyPlan(
       session,
       `trim clip [${ref}]`,
-      (s) => trimClip(s, clip.id, { inPoint, outPoint }),
+      [{ type: "trim", clipId: clip.id, inPoint, outPoint }],
     );
     if (!result.ok) {
       console.error(chalk.red(`Error: ${result.error}`));
@@ -147,10 +146,10 @@ program
     }
 
     const ref = getClipDisplayRefs(session.state.timeline).get(clip.id) ?? fromStr;
-    const result = applyMutation(
+    const result = applyPlan(
       session,
       `move clip [${ref}] → position ${toStr}`,
-      (s) => reorderClip(s, clip.id, toIdx),
+      [{ type: "move", clipId: clip.id, newIndex: toIdx }],
     );
     if (!result.ok) {
       console.error(chalk.red(`Error: ${result.error}`));
@@ -192,10 +191,10 @@ program
     }
 
     const ref = getClipDisplayRefs(session.state.timeline).get(clip.id) ?? clipRef;
-    const result = applyMutation(
+    const result = applyPlan(
       session,
       `split clip [${ref}] at ${timeStr}`,
-      (s) => splitClip(s, clip.id, splitPoint),
+      [{ type: "split", clipId: clip.id, splitPoint }],
     );
     if (!result.ok) {
       console.error(chalk.red(`Error: ${result.error}`));
@@ -234,10 +233,10 @@ program
     }
 
     const ref = getClipDisplayRefs(session.state.timeline).get(clip.id) ?? clipRef;
-    const result = applyMutation(
+    const result = applyPlan(
       session,
       `delete clip [${ref}]`,
-      (s) => removeClip(s, clip.id),
+      [{ type: "delete", clipId: clip.id }],
     );
     if (!result.ok) {
       console.error(chalk.red(`Error: ${result.error}`));

@@ -7,10 +7,9 @@ import { probeFile } from "../../media/probe.js";
 import { renderMediaInfo, formatFileSize } from "../../display/media-info.js";
 import { renderTimeline } from "../../display/timeline.js";
 import { renderClipList } from "../../display/timeline-clip-list.js";
-import { addSource, trimClip, reorderClip, splitClip, removeClip } from "../../project/mutations.js";
 import { clipsInOrder, resolveClip, getClipDisplayRefs } from "../../project/types.js";
 import {
-  applyMutation,
+  applyPlan,
   undoSession,
   redoSession,
   type ProjectSession,
@@ -80,10 +79,10 @@ async function dispatchOpen(args: string[], state: ReplState): Promise<DispatchR
     session = ctx.session;
   }
 
-  const result = applyMutation(
+  const result = applyPlan(
     session,
     `add source ${probe.data.fileName}`,
-    (s) => addSource(s, probe.data),
+    [{ type: "addSource", mediaInfo: probe.data }],
   );
   if (!result.ok) return { output: `Error: ${result.error}`, isError: true };
 
@@ -130,10 +129,10 @@ async function dispatchTrim(args: string[], state: ReplState): Promise<DispatchR
   }
 
   const ref = getClipDisplayRefs(state.session.state.timeline).get(clip.id) ?? args[0]!;
-  const result = applyMutation(
+  const result = applyPlan(
     state.session,
     `trim clip [${ref}]`,
-    (s) => trimClip(s, clip.id, { inPoint, outPoint }),
+    [{ type: "trim", clipId: clip.id, inPoint, outPoint }],
   );
   if (!result.ok) return { output: `Error: ${result.error}`, isError: true };
 
@@ -167,10 +166,10 @@ async function dispatchMove(args: string[], state: ReplState): Promise<DispatchR
   }
 
   const ref = getClipDisplayRefs(state.session.state.timeline).get(clip.id) ?? args[0]!;
-  const result = applyMutation(
+  const result = applyPlan(
     state.session,
     `move clip [${ref}] → position ${args[1]}`,
-    (s) => reorderClip(s, clip.id, toIdx),
+    [{ type: "move", clipId: clip.id, newIndex: toIdx }],
   );
   if (!result.ok) return { output: `Error: ${result.error}`, isError: true };
 
@@ -204,10 +203,10 @@ async function dispatchSplit(args: string[], state: ReplState): Promise<Dispatch
   }
 
   const ref = getClipDisplayRefs(state.session.state.timeline).get(clip.id) ?? args[0]!;
-  const result = applyMutation(
+  const result = applyPlan(
     state.session,
     `split clip [${ref}] at ${args[1]}`,
-    (s) => splitClip(s, clip.id, splitPoint),
+    [{ type: "split", clipId: clip.id, splitPoint }],
   );
   if (!result.ok) return { output: `Error: ${result.error}`, isError: true };
 
@@ -239,10 +238,10 @@ async function dispatchDelete(args: string[], state: ReplState): Promise<Dispatc
   }
 
   const ref = getClipDisplayRefs(state.session.state.timeline).get(clip.id) ?? args[0];
-  const result = applyMutation(
+  const result = applyPlan(
     state.session,
     `delete clip [${ref}]`,
-    (s) => removeClip(s, clip.id),
+    [{ type: "delete", clipId: clip.id }],
   );
   if (!result.ok) return { output: `Error: ${result.error}`, isError: true };
 

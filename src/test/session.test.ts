@@ -6,12 +6,13 @@ import { tmpdir } from "node:os";
 
 import { createProject, saveProject, loadProject } from "../project/io.js";
 import {
-  applyMutation,
+  applyPlan,
   createSession,
   redoSession,
   undoSession,
+  type Operation,
 } from "../project/session.js";
-import { addSource, trimClip, removeClip } from "../project/mutations.js";
+import { addSource } from "../project/mutations.js";
 import { clipsInOrder } from "../project/types.js";
 import type { ProjectState } from "../project/types.js";
 import type { MediaInfo } from "../media/types.js";
@@ -42,6 +43,14 @@ function withOneClip(): ProjectState {
   return r.state;
 }
 
+function trim(clipId: string, inPoint: number, outPoint: number): Operation {
+  return { type: "trim", clipId, inPoint, outPoint };
+}
+
+function del(clipId: string): Operation {
+  return { type: "delete", clipId };
+}
+
 // ── createSession ─────────────────────────────────────────────────────────────
 
 describe("createSession", () => {
@@ -52,16 +61,14 @@ describe("createSession", () => {
   });
 });
 
-// ── applyMutation ─────────────────────────────────────────────────────────────
+// ── applyPlan: single op ──────────────────────────────────────────────────────
 
-describe("applyMutation", () => {
+describe("applyPlan (single op)", () => {
   test("on success pushes previous state to undo with given label", () => {
     const session = createSession(withOneClip());
     const clip = clipsInOrder(session.state.timeline)[0]!;
 
-    const r = applyMutation(session, "trim clip [1]", (s) =>
-      trimClip(s, clip.id, { inPoint: 0, outPoint: 30 }),
-    );
+    const r = applyPlan(session, "trim clip [1]", [trim(clip.id, 0, 30)]);
 
     assert.ok(r.ok);
     assert.equal(r.session.undo.length, 1);
@@ -74,17 +81,13 @@ describe("applyMutation", () => {
     const session = createSession(withOneClip());
     const clip = clipsInOrder(session.state.timeline)[0]!;
 
-    // Trim → undo → leaves a populated redo stack
-    const r1 = applyMutation(session, "trim", (s) =>
-      trimClip(s, clip.id, { inPoint: 0, outPoint: 30 }),
-    );
+    const r1 = applyPlan(session, "trim", [trim(clip.id, 0, 30)]);
     assert.ok(r1.ok);
     const undone = undoSession(r1.session);
     assert.ok(undone.ok);
     assert.equal(undone.session.redo.length, 1);
 
-    // New mutation must wipe the redo stack
-    const r2 = applyMutation(undone.session, "delete", (s) => removeClip(s, clip.id));
+    const r2 = applyPlan(undone.session, "delete", [del(clip.id)]);
     assert.ok(r2.ok);
     assert.deepEqual(r2.session.redo, []);
   });
@@ -93,14 +96,108 @@ describe("applyMutation", () => {
     const session = createSession(withOneClip());
     const clip = clipsInOrder(session.state.timeline)[0]!;
 
-    const r = applyMutation(session, "trim", (s) =>
-      trimClip(s, clip.id, { inPoint: 50, outPoint: 30 }), // invalid
-    );
+    const r = applyPlan(session, "trim", [trim(clip.id, 50, 30)]); // invalid
 
     assert.ok(!r.ok);
     assert.match(r.error, /must be before/);
-    // Session is unchanged — the original is still usable
+    assert.equal(r.failedAt, 0);
     assert.equal(session.undo.length, 0);
+  });
+});
+
+// ── applyPlan: multi-op ───────────────────────────────────────────────────────
+
+describe("applyPlan (multi-op)", () => {
+  test("multi-op plan succeeds with a single undo entry", () => {
+    // Build a project with 3 clips, then in one plan: trim clip 1, delete clip 2
+    let state = freshState();
+    for (let i = 1; i <= 3; i++) {
+      const r = addSource(state, makeMediaInfo({ fileName: `c${i}.mp4` }));
+      assert.ok(r.ok);
+      state = r.state;
+    }
+    const [a, b] = clipsInOrder(state.timeline);
+    const session = createSession(state);
+
+    const r = applyPlan(session, "agent: tighten the intro", [
+      trim(a!.id, 0, 30),
+      del(b!.id),
+    ]);
+
+    assert.ok(r.ok);
+    assert.equal(r.session.undo.length, 1, "exactly one undo entry for the whole plan");
+    assert.equal(r.session.undo[0]!.label, "agent: tighten the intro");
+    // Both ops applied
+    assert.equal(r.session.state.timeline.clips[a!.id]!.outPoint, 30);
+    assert.equal(r.session.state.timeline.clips[b!.id], undefined);
+    // Snapshot is the pre-plan state — undo rolls back ALL ops at once
+    const undone = undoSession(r.session);
+    assert.ok(undone.ok);
+    assert.equal(undone.session.state.timeline.clips[a!.id]!.outPoint, 120);
+    assert.ok(undone.session.state.timeline.clips[b!.id]);
+  });
+
+  test("failure at op #2 aborts the plan — no state change, no snapshot, failedAt === 1", () => {
+    const session = createSession(withOneClip());
+    const clip = clipsInOrder(session.state.timeline)[0]!;
+
+    // Op #1 is valid; op #2 is invalid (in >= out)
+    const r = applyPlan(session, "agent: bad plan", [
+      trim(clip.id, 0, 60),
+      trim(clip.id, 50, 30),
+    ]);
+
+    assert.ok(!r.ok);
+    assert.equal(r.failedAt, 1);
+    assert.match(r.error, /must be before/);
+    // The original session is untouched — no partial state lingering
+    assert.equal(session.undo.length, 0);
+    assert.equal(session.state.timeline.clips[clip.id]!.outPoint, 120);
+  });
+
+  test("multi-op plan label survives undo/redo round-trip", () => {
+    let state = freshState();
+    for (let i = 1; i <= 2; i++) {
+      const r = addSource(state, makeMediaInfo({ fileName: `c${i}.mp4` }));
+      assert.ok(r.ok);
+      state = r.state;
+    }
+    const [a, b] = clipsInOrder(state.timeline);
+    const session = createSession(state);
+
+    const r = applyPlan(session, "trim both clips", [
+      trim(a!.id, 0, 60),
+      trim(b!.id, 0, 45),
+    ]);
+    assert.ok(r.ok);
+
+    const undone = undoSession(r.session);
+    assert.ok(undone.ok);
+    assert.equal(undone.label, "trim both clips");
+
+    const redone = redoSession(undone.session);
+    assert.ok(redone.ok);
+    assert.equal(redone.label, "trim both clips");
+    assert.equal(redone.session.state.timeline.clips[a!.id]!.outPoint, 60);
+    assert.equal(redone.session.state.timeline.clips[b!.id]!.outPoint, 45);
+  });
+
+  test("empty plan is a no-op — no snapshot pushed, redo preserved", () => {
+    const session = createSession(withOneClip());
+    const clip = clipsInOrder(session.state.timeline)[0]!;
+
+    // Populate redo stack first
+    const a = applyPlan(session, "trim", [trim(clip.id, 0, 30)]);
+    assert.ok(a.ok);
+    const undone = undoSession(a.session);
+    assert.ok(undone.ok);
+    assert.equal(undone.session.redo.length, 1);
+
+    const r = applyPlan(undone.session, "nothing", []);
+    assert.ok(r.ok);
+    // Session is unchanged — undo length same, redo NOT cleared
+    assert.equal(r.session.undo.length, undone.session.undo.length);
+    assert.equal(r.session.redo.length, undone.session.redo.length);
   });
 });
 
@@ -117,15 +214,12 @@ describe("undoSession", () => {
     const session = createSession(withOneClip());
     const clip = clipsInOrder(session.state.timeline)[0]!;
 
-    const after = applyMutation(session, "trim clip [1]", (s) =>
-      trimClip(s, clip.id, { inPoint: 0, outPoint: 30 }),
-    );
+    const after = applyPlan(session, "trim clip [1]", [trim(clip.id, 0, 30)]);
     assert.ok(after.ok);
 
     const undone = undoSession(after.session);
     assert.ok(undone.ok);
     assert.equal(undone.label, "trim clip [1]");
-    // Restored to the original 120s clip
     assert.equal(undone.session.state.timeline.clips[clip.id]!.outPoint, 120);
     assert.equal(undone.session.undo.length, 0);
     assert.equal(undone.session.redo.length, 1);
@@ -143,9 +237,7 @@ describe("redoSession", () => {
     const session = createSession(withOneClip());
     const clip = clipsInOrder(session.state.timeline)[0]!;
 
-    const after = applyMutation(session, "trim clip [1]", (s) =>
-      trimClip(s, clip.id, { inPoint: 0, outPoint: 30 }),
-    );
+    const after = applyPlan(session, "trim clip [1]", [trim(clip.id, 0, 30)]);
     assert.ok(after.ok);
     const undone = undoSession(after.session);
     assert.ok(undone.ok);
@@ -162,15 +254,13 @@ describe("redoSession", () => {
 // ── Multi-step round-trips ────────────────────────────────────────────────────
 
 describe("undo/redo round-trips", () => {
-  test("three mutations + three undos returns to the original state", () => {
+  test("three plans + three undos returns to the original state", () => {
     let session = createSession(withOneClip());
     const original = session.state;
     const clip = clipsInOrder(session.state.timeline)[0]!;
 
     for (const out of [60, 45, 30]) {
-      const r = applyMutation(session, `trim → ${out}`, (s) =>
-        trimClip(s, clip.id, { inPoint: 0, outPoint: out }),
-      );
+      const r = applyPlan(session, `trim → ${out}`, [trim(clip.id, 0, out)]);
       assert.ok(r.ok);
       session = r.session;
     }
@@ -190,21 +280,16 @@ describe("undo/redo round-trips", () => {
     const session = createSession(withOneClip());
     const clip = clipsInOrder(session.state.timeline)[0]!;
 
-    const a = applyMutation(session, "trim → 60", (s) =>
-      trimClip(s, clip.id, { inPoint: 0, outPoint: 60 }),
-    );
+    const a = applyPlan(session, "trim → 60", [trim(clip.id, 0, 60)]);
     assert.ok(a.ok);
 
     const undone = undoSession(a.session);
     assert.ok(undone.ok);
     assert.equal(undone.session.redo.length, 1);
 
-    const b = applyMutation(undone.session, "trim → 45", (s) =>
-      trimClip(s, clip.id, { inPoint: 0, outPoint: 45 }),
-    );
+    const b = applyPlan(undone.session, "trim → 45", [trim(clip.id, 0, 45)]);
     assert.ok(b.ok);
     assert.deepEqual(b.session.redo, []);
-    // Now redo should be nothing-to-redo
     const r = redoSession(b.session);
     assert.ok(!r.ok);
   });
@@ -225,14 +310,9 @@ describe("io session persistence", () => {
     const session0 = createSession(withOneClip());
     const clip = clipsInOrder(session0.state.timeline)[0]!;
 
-    // One applied mutation and one un-done mutation → both stacks populated
-    const r1 = applyMutation(session0, "trim → 60", (s) =>
-      trimClip(s, clip.id, { inPoint: 0, outPoint: 60 }),
-    );
+    const r1 = applyPlan(session0, "trim → 60", [trim(clip.id, 0, 60)]);
     assert.ok(r1.ok);
-    const r2 = applyMutation(r1.session, "trim → 30", (s) =>
-      trimClip(s, clip.id, { inPoint: 0, outPoint: 30 }),
-    );
+    const r2 = applyPlan(r1.session, "trim → 30", [trim(clip.id, 0, 30)]);
     assert.ok(r2.ok);
     const undone = undoSession(r2.session);
     assert.ok(undone.ok);
@@ -249,19 +329,14 @@ describe("io session persistence", () => {
   });
 
   test("loading a v1 file produces empty undo/redo stacks (backward compat)", async () => {
-    // Hand-write a minimal v1 file with the original flat shape (no undo/redo)
     const v1: ProjectState = withOneClip();
-    const v1File = {
-      ...v1,
-      version: 1, // explicitly v1
-    };
+    const v1File = { ...v1, version: 1 };
     const filePath = join(dir, "legacy-v1.cutcli.json");
     writeFileSync(filePath, JSON.stringify(v1File, null, 2), "utf-8");
 
     const loaded = await loadProject(filePath);
     assert.deepEqual(loaded.undo, []);
     assert.deepEqual(loaded.redo, []);
-    // State content survives the load
     assert.equal(clipsInOrder(loaded.state.timeline).length, 1);
   });
 });

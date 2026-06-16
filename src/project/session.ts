@@ -1,4 +1,6 @@
 import type { ProjectState, MutationResult } from "./types.js";
+import type { MediaInfo } from "../media/types.js";
+import { addSource, trimClip, splitClip, reorderClip, removeClip } from "./mutations.js";
 
 // A point-in-time snapshot of project state, tagged with the action that
 // produced it. The label describes the *action being undone* — when we push
@@ -17,9 +19,19 @@ export interface ProjectSession {
   redo: Snapshot[];
 }
 
+// The unified operation vocabulary. Every state change — slash command or
+// agent turn — is one of these. The agent's propose_edit_plan tool emits this
+// shape directly so its output flows straight into applyPlan.
+export type Operation =
+  | { type: "addSource"; mediaInfo: MediaInfo }
+  | { type: "trim"; clipId: string; inPoint?: number; outPoint?: number }
+  | { type: "split"; clipId: string; splitPoint: number }
+  | { type: "move"; clipId: string; newIndex: number }
+  | { type: "delete"; clipId: string };
+
 export type ApplyResult =
   | { ok: true; session: ProjectSession }
-  | { ok: false; error: string };
+  | { ok: false; error: string; failedAt: number };
 
 export type UndoResult =
   | { ok: true; session: ProjectSession; label: string }
@@ -34,30 +46,55 @@ export function createSession(state: ProjectState): ProjectSession {
 }
 
 /**
- * Run a mutation against the session's current state. On success: push the
- * previous state to the undo stack (tagged with `label`), clear the redo stack,
- * and return a session with the new state. On failure: return the mutation's
- * error and leave the session untouched.
+ * Apply a plan (list of operations) atomically against the session's state.
+ * One snapshot is pushed for the whole plan, labeled with `label`. If any
+ * operation fails, the plan is aborted: no snapshot is pushed, no state
+ * change persists, and failedAt indicates which op (0-indexed) broke.
  *
- * This is the *only* sanctioned path that mutates session state — every
- * dispatch site (CLI + REPL) routes through here so history stays consistent.
+ * Empty plans are a no-op (no snapshot, no redo clear) — they don't pollute
+ * history.
+ *
+ * This is the *only* sanctioned path that mutates session state. Slash
+ * commands pass a one-element ops array; the agent passes many ops in one
+ * call labeled with the user's natural-language prompt.
  */
-export function applyMutation(
+export function applyPlan(
   session: ProjectSession,
   label: string,
-  fn: (state: ProjectState) => MutationResult,
+  ops: Operation[],
 ): ApplyResult {
-  const result = fn(session.state);
-  if (!result.ok) return { ok: false, error: result.error };
+  if (ops.length === 0) return { ok: true, session };
+
+  let running = session.state;
+  for (let i = 0; i < ops.length; i++) {
+    const result = executeOperation(running, ops[i]!);
+    if (!result.ok) return { ok: false, error: result.error, failedAt: i };
+    running = result.state;
+  }
 
   return {
     ok: true,
     session: {
-      state: result.state,
+      state: running,
       undo: [...session.undo, { state: session.state, label }],
       redo: [],
     },
   };
+}
+
+function executeOperation(state: ProjectState, op: Operation): MutationResult {
+  switch (op.type) {
+    case "addSource":
+      return addSource(state, op.mediaInfo);
+    case "trim":
+      return trimClip(state, op.clipId, { inPoint: op.inPoint, outPoint: op.outPoint });
+    case "split":
+      return splitClip(state, op.clipId, op.splitPoint);
+    case "move":
+      return reorderClip(state, op.clipId, op.newIndex);
+    case "delete":
+      return removeClip(state, op.clipId);
+  }
 }
 
 /**
