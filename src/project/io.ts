@@ -4,7 +4,7 @@ import type { ProjectState, SourceFile, Clip, Timeline } from "./types.js";
 import type { ProjectSession, Snapshot } from "./session.js";
 import { createSession } from "./session.js";
 
-const SUPPORTED_VERSION = 2;
+const SUPPORTED_VERSION = 3;
 
 // ── Create ────────────────────────────────────────────────────────────────────
 
@@ -67,7 +67,7 @@ export async function loadProject(filePath: string): Promise<ProjectSession> {
   }
 
   const version = file["version"] as number;
-  if (version !== 1 && version !== 2) {
+  if (version !== 1 && version !== 2 && version !== 3) {
     throw new Error(`Unsupported project version ${version} (expected ${SUPPORTED_VERSION})`);
   }
 
@@ -117,9 +117,15 @@ function extractState(file: Record<string, unknown>): ProjectState {
     name: file["name"] as string,
     createdAt: file["createdAt"] as string,
     updatedAt: file["updatedAt"] as string,
-    sources: file["sources"] as SourceFile[],
+    sources: ensureAnalyses(file["sources"] as SourceFile[]),
     timeline: file["timeline"] as Timeline,
   };
+}
+
+// v1/v2 sources have no `analyses` field. Default to `{}` so callers can
+// always treat the field as present.
+function ensureAnalyses(sources: SourceFile[]): SourceFile[] {
+  return sources.map((s) => (s.analyses ? s : { ...s, analyses: {} }));
 }
 
 function parseSnapshotArray(value: unknown, field: string, filePath: string): Snapshot[] {
@@ -175,7 +181,7 @@ function migrateArrayTimeline(
     name: file["name"] as string,
     createdAt: file["createdAt"] as string,
     updatedAt: file["updatedAt"] as string,
-    sources: file["sources"] as SourceFile[],
+    sources: ensureAnalyses(file["sources"] as SourceFile[]),
     timeline,
   };
 }

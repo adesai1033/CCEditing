@@ -11,6 +11,37 @@ export interface SourceFile {
   videoCodec: string;
   audioCodec: string | null;
   fileSize: number;       // bytes
+  analyses: SourceAnalyses;
+}
+
+// Cached results of video-understanding tool calls. Populated lazily by the
+// agent's analysis tools and persisted in the project file so subsequent
+// sessions reuse the work.
+export interface SourceAnalyses {
+  twelveLabs?: {
+    indexId: string;
+    videoId: string;
+    status: "indexed" | "failed";
+    indexedAt: string;     // ISO timestamp
+    error?: string;
+  };
+  description?: {
+    text: string;
+    model: string;         // e.g. "gemini-2.5-flash"
+    generatedAt: string;
+  };
+  scenes?: {
+    threshold: number;
+    boundaries: number[];   // seconds where shot cuts occur
+    detectedAt: string;
+  };
+  moments?: MomentCacheEntry[];
+}
+
+export interface MomentCacheEntry {
+  query: string;
+  hits: Array<{ start: number; end: number; confidence: number }>;
+  retrievedAt: string;
 }
 
 export interface Clip {
@@ -138,5 +169,6 @@ export function sourceFileFromMediaInfo(info: MediaInfo): SourceFile {
     videoCodec: info.videoCodec,
     audioCodec: info.audioCodec,
     fileSize: info.fileSize,
+    analyses: {},
   };
 }
