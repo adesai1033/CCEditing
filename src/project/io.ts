@@ -1,8 +1,10 @@
 import { readFile, writeFile, access } from "node:fs/promises";
 import { constants } from "node:fs";
 import type { ProjectState, SourceFile, Clip, Timeline } from "./types.js";
+import type { ProjectSession, Snapshot } from "./session.js";
+import { createSession } from "./session.js";
 
-const SUPPORTED_VERSION = 1;
+const SUPPORTED_VERSION = 2;
 
 // ── Create ────────────────────────────────────────────────────────────────────
 
@@ -20,14 +22,24 @@ export function createProject(name: string): ProjectState {
 
 // ── Save ──────────────────────────────────────────────────────────────────────
 
-export async function saveProject(state: ProjectState, filePath: string): Promise<void> {
-  const json = JSON.stringify(state, null, 2);
+/**
+ * Persist a session. The file is the state fields flattened at the top level,
+ * plus undo/redo arrays as siblings. Each snapshot stores a full ProjectState.
+ */
+export async function saveProject(session: ProjectSession, filePath: string): Promise<void> {
+  const payload = {
+    ...session.state,
+    version: SUPPORTED_VERSION,
+    undo: session.undo,
+    redo: session.redo,
+  };
+  const json = JSON.stringify(payload, null, 2);
   await writeFile(filePath, json, "utf-8");
 }
 
 // ── Load ──────────────────────────────────────────────────────────────────────
 
-export async function loadProject(filePath: string): Promise<ProjectState> {
+export async function loadProject(filePath: string): Promise<ProjectSession> {
   let raw: string;
   try {
     raw = await readFile(filePath, "utf-8");
@@ -48,46 +60,90 @@ export async function loadProject(filePath: string): Promise<ProjectState> {
     throw new Error(`Project file has unexpected structure: ${filePath}`);
   }
 
-  const state = parsed as Record<string, unknown>;
+  const file = parsed as Record<string, unknown>;
 
-  if (typeof state["version"] !== "number") {
+  if (typeof file["version"] !== "number") {
     throw new Error(`Project file is missing a version field: ${filePath}`);
   }
-  if (state["version"] !== SUPPORTED_VERSION) {
-    throw new Error(
-      `Unsupported project version ${state["version"]} (expected ${SUPPORTED_VERSION})`
-    );
+
+  const version = file["version"] as number;
+  if (version !== 1 && version !== 2) {
+    throw new Error(`Unsupported project version ${version} (expected ${SUPPORTED_VERSION})`);
   }
-  if (typeof state["name"] !== "string") {
+
+  if (typeof file["name"] !== "string") {
     throw new Error(`Project file is missing required field "name": ${filePath}`);
   }
-  if (!Array.isArray(state["sources"])) {
+  if (!Array.isArray(file["sources"])) {
     throw new Error(`Project file is missing required field "sources": ${filePath}`);
   }
 
-  const timeline = state["timeline"] as Record<string, unknown> | undefined;
+  const timeline = file["timeline"] as Record<string, unknown> | undefined;
   if (typeof timeline !== "object" || timeline === null) {
     throw new Error(`Project file is missing required field "timeline": ${filePath}`);
   }
 
-  // Migrate old array-based format to linked list
+  // Migrate ancient array-based timeline (predates v1's linked list)
+  let state: ProjectState;
   if (Array.isArray(timeline["clips"])) {
-    return migrateArrayTimeline(state, timeline["clips"] as OldClip[]);
+    state = migrateArrayTimeline(file, timeline["clips"] as OldClip[]);
+  } else {
+    if (typeof timeline["clips"] !== "object" || timeline["clips"] === null || Array.isArray(timeline["clips"])) {
+      throw new Error(`Project file has invalid timeline.clips: ${filePath}`);
+    }
+    if (!("headId" in timeline) || !("tailId" in timeline)) {
+      throw new Error(`Project file is missing timeline.headId/tailId: ${filePath}`);
+    }
+    // Extract just the ProjectState fields from the flat envelope
+    state = extractState(file);
   }
 
-  if (typeof timeline["clips"] !== "object" || timeline["clips"] === null || Array.isArray(timeline["clips"])) {
-    throw new Error(`Project file has invalid timeline.clips: ${filePath}`);
-  }
-  if (!("headId" in timeline) || !("tailId" in timeline)) {
-    throw new Error(`Project file is missing timeline.headId/tailId: ${filePath}`);
+  // v1 had no history. v2's stacks are optional in case the file was written
+  // by an older v2-compatible tool that skipped them.
+  if (version === 1) {
+    return createSession(state);
   }
 
-  return parsed as ProjectState;
+  const undo = parseSnapshotArray(file["undo"], "undo", filePath);
+  const redo = parseSnapshotArray(file["redo"], "redo", filePath);
+  return { state, undo, redo };
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function extractState(file: Record<string, unknown>): ProjectState {
+  return {
+    version: SUPPORTED_VERSION,
+    name: file["name"] as string,
+    createdAt: file["createdAt"] as string,
+    updatedAt: file["updatedAt"] as string,
+    sources: file["sources"] as SourceFile[],
+    timeline: file["timeline"] as Timeline,
+  };
+}
+
+function parseSnapshotArray(value: unknown, field: string, filePath: string): Snapshot[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    throw new Error(`Project file field "${field}" must be an array: ${filePath}`);
+  }
+  return value.map((entry, i) => {
+    if (typeof entry !== "object" || entry === null) {
+      throw new Error(`Project file ${field}[${i}] is not an object: ${filePath}`);
+    }
+    const s = entry as Record<string, unknown>;
+    if (typeof s["label"] !== "string") {
+      throw new Error(`Project file ${field}[${i}] is missing "label": ${filePath}`);
+    }
+    if (typeof s["state"] !== "object" || s["state"] === null) {
+      throw new Error(`Project file ${field}[${i}] is missing "state": ${filePath}`);
+    }
+    return { state: s["state"] as ProjectState, label: s["label"] };
+  });
 }
 
 // ── Migration ─────────────────────────────────────────────────────────────────
 
-// Shape of a clip in the old array-based format (no prevId/nextId)
 interface OldClip {
   id: string;
   sourceId: string;
@@ -97,8 +153,8 @@ interface OldClip {
 }
 
 function migrateArrayTimeline(
-  state: Record<string, unknown>,
-  oldClips: OldClip[]
+  file: Record<string, unknown>,
+  oldClips: OldClip[],
 ): ProjectState {
   const clips: Record<string, Clip> = {};
   let headId: string | null = null;
@@ -114,13 +170,20 @@ function migrateArrayTimeline(
   }
 
   const timeline: Timeline = { headId, tailId, clips };
-  return { ...(state as unknown as ProjectState), timeline };
+  return {
+    version: SUPPORTED_VERSION,
+    name: file["name"] as string,
+    createdAt: file["createdAt"] as string,
+    updatedAt: file["updatedAt"] as string,
+    sources: file["sources"] as SourceFile[],
+    timeline,
+  };
 }
 
 // ── Source validation ─────────────────────────────────────────────────────────
 
 export async function validateSources(
-  state: ProjectState
+  state: ProjectState,
 ): Promise<{ valid: SourceFile[]; missing: SourceFile[] }> {
   const results = await Promise.all(
     state.sources.map(async (source) => {
@@ -130,7 +193,7 @@ export async function validateSources(
       } catch {
         return { source, exists: false };
       }
-    })
+    }),
   );
 
   return {

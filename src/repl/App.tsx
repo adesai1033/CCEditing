@@ -12,7 +12,7 @@ import { clipsInOrder } from "../project/types.js";
 
 export function App() {
   const [entries, setEntries]               = useState<HistoryEntry[]>([]);
-  const [replState, setReplState]           = useState<ReplState>({ project: null });
+  const [replState, setReplState]           = useState<ReplState>({ session: null });
   const [inputValue, setInputValue]         = useState<string>("");
   const [viewport, setViewport]             = useState<ViewportState | null>(null);
   const [timelineActive, setTimelineActive] = useState<boolean>(false);
@@ -33,8 +33,8 @@ export function App() {
       const ctx = await loadOrCreateProject();
       setPendingEntry(null);
       if (ctx.ok && ctx.existed) {
-        setReplState({ project: ctx.state });
-        const clipCount = clipsInOrder(ctx.state.timeline).length;
+        setReplState({ session: ctx.session });
+        const clipCount = clipsInOrder(ctx.session.state.timeline).length;
         setEntries([{
           id,
           input: "(startup)",
@@ -75,12 +75,12 @@ export function App() {
   // ── Viewport handlers ──────────────────────────────────────────────────────
 
   function totalDuration(state: ReplState): number {
-    if (!state.project) return 0;
-    return clipsInOrder(state.project.timeline).reduce((s, c) => s + (c.outPoint - c.inPoint), 0);
+    if (!state.session) return 0;
+    return clipsInOrder(state.session.state.timeline).reduce((s, c) => s + (c.outPoint - c.inPoint), 0);
   }
 
   function handleViewportZoom(dir: "in" | "out"): void {
-    if (!timelineActive || !replState.project) return;
+    if (!timelineActive || !replState.session) return;
     const total = totalDuration(replState);
     const cur = viewport ?? { startTime: 0, viewDuration: total };
     const newViewport: ViewportState = {
@@ -88,8 +88,8 @@ export function App() {
       viewDuration: Math.max(1, cur.viewDuration * (dir === "in" ? 0.667 : 1.5)),
     };
     setViewport(newViewport);
-    const rendered = renderTimeline(replState.project, process.stdout.columns, newViewport)
-      + "\n" + renderClipList(replState.project);
+    const rendered = renderTimeline(replState.session.state, process.stdout.columns, newViewport)
+      + "\n" + renderClipList(replState.session.state);
     setEntries((prev) => [...prev, {
       id: crypto.randomUUID(),
       input: `(zoom ${dir})`,
@@ -99,7 +99,7 @@ export function App() {
   }
 
   function handleViewportScroll(dir: "left" | "right"): void {
-    if (!replState.project) return;
+    if (!replState.session) return;
     const total = totalDuration(replState);
     const cur = viewport ?? { startTime: 0, viewDuration: total };
     const delta = cur.viewDuration * 0.2 * (dir === "right" ? 1 : -1);
@@ -108,8 +108,8 @@ export function App() {
       startTime: Math.max(0, cur.startTime + delta),
     };
     setViewport(newViewport);
-    const rendered = renderTimeline(replState.project, process.stdout.columns, newViewport)
-      + "\n" + renderClipList(replState.project);
+    const rendered = renderTimeline(replState.session.state, process.stdout.columns, newViewport)
+      + "\n" + renderClipList(replState.session.state);
     setEntries((prev) => [...prev, {
       id: crypto.randomUUID(),
       input: `(scroll ${dir})`,

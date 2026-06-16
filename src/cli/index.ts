@@ -10,8 +10,9 @@ import { renderTimeline } from "../display/timeline.js";
 import { renderClipList } from "../display/timeline-clip-list.js";
 import { execute } from "../engine/engine.js";
 import { parseTime } from "../utils/time.js";
-import { addSource, trimClip, reorderClip, splitClip } from "../project/mutations.js";
-import { clipsInOrder, resolveClip } from "../project/types.js";
+import { addSource, trimClip, reorderClip, splitClip, removeClip } from "../project/mutations.js";
+import { clipsInOrder, resolveClip, getClipDisplayRefs } from "../project/types.js";
+import { applyMutation, undoSession, redoSession, type ProjectSession } from "../project/session.js";
 import { formatFileSize } from "../display/media-info.js";
 import {
   projectFilePath,
@@ -34,7 +35,6 @@ program
   .action(async (file: string) => {
     const absFile = path.resolve(file);
 
-    // Probe the file
     const probe = await probeFile(absFile);
     if (!probe.ok) {
       console.error(chalk.red(`Error: ${probe.error}`));
@@ -45,35 +45,32 @@ program
     console.log(renderMediaInfo(probe.data));
     console.log();
 
-    // Load or create project
     const ctx = await loadOrCreateProject();
     if (!ctx.ok) {
       console.error(chalk.red(`Error: ${ctx.error}`));
       process.exit(1);
     }
 
-    // Add source
-    const result = addSource(ctx.state, probe.data);
+    const result = applyMutation(
+      ctx.session,
+      `add source ${probe.data.fileName}`,
+      (s) => addSource(s, probe.data),
+    );
     if (!result.ok) {
       console.error(chalk.red(`Error: ${result.error}`));
       process.exit(1);
     }
 
-    // Save
-    const saved = await saveProjectToStandardPath(result.state);
-    if (!saved.ok) {
-      console.error(chalk.red(`Error saving project: ${saved.error}`));
-      process.exit(1);
-    }
+    await saveOrExit(result.session);
 
     const statusMsg = ctx.existed
-      ? `Added to project  ·  ${chalk.dim(projectFilePath())}  (${result.state.sources.length} sources, ${clipsInOrder(result.state.timeline).length} clips)`
+      ? `Added to project  ·  ${chalk.dim(projectFilePath())}  (${result.session.state.sources.length} sources, ${clipsInOrder(result.session.state.timeline).length} clips)`
       : `Created project  ·  ${chalk.dim(projectFilePath())}`;
     console.log(chalk.green(statusMsg));
     console.log();
-    console.log(renderTimeline(result.state, process.stdout.columns));
+    console.log(renderTimeline(result.session.state, process.stdout.columns));
     console.log();
-    console.log(renderClipList(result.state));
+    console.log(renderClipList(result.session.state));
     console.log();
   });
 
@@ -83,19 +80,11 @@ program
   .command("trim <index> <start> <end>")
   .description("Trim a clip in the project by 1-based index")
   .action(async (indexStr: string, startStr: string, endStr: string) => {
-    const ctx = await loadOrCreateProject();
-    if (!ctx.ok) {
-      console.error(chalk.red(`Error: ${ctx.error}`));
-      process.exit(1);
-    }
-    if (!ctx.existed) {
-      console.error(chalk.red("Error: No project found. Run `cutcli open <file>` first."));
-      process.exit(1);
-    }
+    const session = await requireProject();
 
-    const clip = resolveClip(ctx.state.timeline, indexStr);
+    const clip = resolveClip(session.state.timeline, indexStr);
     if (!clip) {
-      const count = clipsInOrder(ctx.state.timeline).length;
+      const count = clipsInOrder(session.state.timeline).length;
       console.error(chalk.red(`Error: Clip "${indexStr}" not found (project has ${count} clip${count === 1 ? "" : "s"}).`));
       process.exit(1);
     }
@@ -110,27 +99,28 @@ program
       process.exit(1);
     }
 
-    const result = trimClip(ctx.state, clip.id, { inPoint, outPoint });
+    const ref = getClipDisplayRefs(session.state.timeline).get(clip.id) ?? indexStr;
+    const result = applyMutation(
+      session,
+      `trim clip [${ref}]`,
+      (s) => trimClip(s, clip.id, { inPoint, outPoint }),
+    );
     if (!result.ok) {
       console.error(chalk.red(`Error: ${result.error}`));
       process.exit(1);
     }
 
-    const saved = await saveProjectToStandardPath(result.state);
-    if (!saved.ok) {
-      console.error(chalk.red(`Error saving project: ${saved.error}`));
-      process.exit(1);
-    }
+    await saveOrExit(result.session);
 
-    const trimmedClip = result.state.timeline.clips[clip.id]!;
+    const trimmedClip = result.session.state.timeline.clips[clip.id]!;
     const duration = trimmedClip.outPoint - trimmedClip.inPoint;
     console.log();
     console.log(chalk.green(`Trimmed clip ${trimmedClip.label}`));
     console.log(chalk.dim(`  ${startStr} → ${endStr}  (${formatSeconds(duration)})`));
     console.log();
-    console.log(renderTimeline(result.state, process.stdout.columns));
+    console.log(renderTimeline(result.session.state, process.stdout.columns));
     console.log();
-    console.log(renderClipList(result.state));
+    console.log(renderClipList(result.session.state));
     console.log();
   });
 
@@ -140,48 +130,41 @@ program
   .command("move <from> <to>")
   .description("Move a clip to a new position (1-based indices)")
   .action(async (fromStr: string, toStr: string) => {
-    const ctx = await loadOrCreateProject();
-    if (!ctx.ok) {
-      console.error(chalk.red(`Error: ${ctx.error}`));
-      process.exit(1);
-    }
-    if (!ctx.existed) {
-      console.error(chalk.red("Error: No project found. Run `cutcli open <file>` first."));
-      process.exit(1);
-    }
+    const session = await requireProject();
 
-    const clip = resolveClip(ctx.state.timeline, fromStr);
+    const clip = resolveClip(session.state.timeline, fromStr);
     if (!clip) {
-      const count = clipsInOrder(ctx.state.timeline).length;
+      const count = clipsInOrder(session.state.timeline).length;
       console.error(chalk.red(`Error: Clip "${fromStr}" not found (project has ${count} clip${count === 1 ? "" : "s"}).`));
       process.exit(1);
     }
 
     const toIdx = parseInt(toStr, 10) - 1;
-    const count = clipsInOrder(ctx.state.timeline).length;
+    const count = clipsInOrder(session.state.timeline).length;
     if (isNaN(toIdx) || toIdx < 0 || toIdx >= count) {
       console.error(chalk.red(`Error: To-index ${toStr} out of range (project has ${count} clip${count === 1 ? "" : "s"}).`));
       process.exit(1);
     }
 
-    const result = reorderClip(ctx.state, clip.id, toIdx);
+    const ref = getClipDisplayRefs(session.state.timeline).get(clip.id) ?? fromStr;
+    const result = applyMutation(
+      session,
+      `move clip [${ref}] → position ${toStr}`,
+      (s) => reorderClip(s, clip.id, toIdx),
+    );
     if (!result.ok) {
       console.error(chalk.red(`Error: ${result.error}`));
       process.exit(1);
     }
 
-    const saved = await saveProjectToStandardPath(result.state);
-    if (!saved.ok) {
-      console.error(chalk.red(`Error saving project: ${saved.error}`));
-      process.exit(1);
-    }
+    await saveOrExit(result.session);
 
     console.log();
     console.log(chalk.green(`Moved clip [${fromStr}] ${clip.label} → position [${toStr}]`));
     console.log();
-    console.log(renderTimeline(result.state, process.stdout.columns));
+    console.log(renderTimeline(result.session.state, process.stdout.columns));
     console.log();
-    console.log(renderClipList(result.state));
+    console.log(renderClipList(result.session.state));
     console.log();
   });
 
@@ -191,19 +174,11 @@ program
   .command("split <clip> <time>")
   .description("Split a clip at a source time into two consecutive clips")
   .action(async (clipRef: string, timeStr: string) => {
-    const ctx = await loadOrCreateProject();
-    if (!ctx.ok) {
-      console.error(chalk.red(`Error: ${ctx.error}`));
-      process.exit(1);
-    }
-    if (!ctx.existed) {
-      console.error(chalk.red("Error: No project found. Run `cutcli open <file>` first."));
-      process.exit(1);
-    }
+    const session = await requireProject();
 
-    const clip = resolveClip(ctx.state.timeline, clipRef);
+    const clip = resolveClip(session.state.timeline, clipRef);
     if (!clip) {
-      const count = clipsInOrder(ctx.state.timeline).length;
+      const count = clipsInOrder(session.state.timeline).length;
       console.error(chalk.red(`Error: Clip "${clipRef}" not found (project has ${count} clip${count === 1 ? "" : "s"}).`));
       process.exit(1);
     }
@@ -216,27 +191,128 @@ program
       process.exit(1);
     }
 
-    const result = splitClip(ctx.state, clip.id, splitPoint);
+    const ref = getClipDisplayRefs(session.state.timeline).get(clip.id) ?? clipRef;
+    const result = applyMutation(
+      session,
+      `split clip [${ref}] at ${timeStr}`,
+      (s) => splitClip(s, clip.id, splitPoint),
+    );
     if (!result.ok) {
       console.error(chalk.red(`Error: ${result.error}`));
       process.exit(1);
     }
 
-    const saved = await saveProjectToStandardPath(result.state);
-    if (!saved.ok) {
-      console.error(chalk.red(`Error saving project: ${saved.error}`));
+    await saveOrExit(result.session);
+
+    const displayRefs = getClipDisplayRefs(result.session.state.timeline);
+    const ordered = clipsInOrder(result.session.state.timeline);
+    const newSecondClip = ordered[ordered.findIndex((c) => c.id === clip.id) + 1]!;
+    const refA = displayRefs.get(clip.id) ?? "?";
+    const refB = displayRefs.get(newSecondClip.id) ?? "?";
+    console.log();
+    console.log(chalk.green(`Split ${clip.label} at ${timeStr} → clips [${refA}] and [${refB}]`));
+    console.log();
+    console.log(renderTimeline(result.session.state, process.stdout.columns));
+    console.log();
+    console.log(renderClipList(result.session.state));
+    console.log();
+  });
+
+// ── delete ────────────────────────────────────────────────────────────────────
+
+program
+  .command("delete <clip>")
+  .description("Remove a clip from the timeline (source file is kept)")
+  .action(async (clipRef: string) => {
+    const session = await requireProject();
+
+    const clip = resolveClip(session.state.timeline, clipRef);
+    if (!clip) {
+      const count = clipsInOrder(session.state.timeline).length;
+      console.error(chalk.red(`Error: Clip "${clipRef}" not found (project has ${count} clip${count === 1 ? "" : "s"}).`));
       process.exit(1);
     }
 
-    const ordered = clipsInOrder(result.state.timeline);
-    const idx = ordered.findIndex((c) => c.id === clip.id);
+    const ref = getClipDisplayRefs(session.state.timeline).get(clip.id) ?? clipRef;
+    const result = applyMutation(
+      session,
+      `delete clip [${ref}]`,
+      (s) => removeClip(s, clip.id),
+    );
+    if (!result.ok) {
+      console.error(chalk.red(`Error: ${result.error}`));
+      process.exit(1);
+    }
+
+    await saveOrExit(result.session);
+
+    const remaining = clipsInOrder(result.session.state.timeline).length;
     console.log();
-    console.log(chalk.green(`Split ${clip.label} at ${timeStr} → clips [${idx + 1}] and [${idx + 2}]`));
+    console.log(chalk.green(`Deleted clip ${clip.label}`));
+    console.log(chalk.dim(`  ${remaining} clip${remaining === 1 ? "" : "s"} remaining`));
     console.log();
-    console.log(renderTimeline(result.state, process.stdout.columns));
+    if (remaining > 0) {
+      console.log(renderTimeline(result.session.state, process.stdout.columns));
+      console.log();
+      console.log(renderClipList(result.session.state));
+      console.log();
+    }
+  });
+
+// ── undo ──────────────────────────────────────────────────────────────────────
+
+program
+  .command("undo")
+  .description("Undo the most recent change")
+  .action(async () => {
+    const session = await requireProject();
+
+    const result = undoSession(session);
+    if (!result.ok) {
+      console.error(chalk.yellow("Nothing to undo."));
+      process.exit(0);
+    }
+
+    await saveOrExit(result.session);
+
     console.log();
-    console.log(renderClipList(result.state));
+    console.log(chalk.green(`Undid: ${result.label}`));
     console.log();
+    const clips = clipsInOrder(result.session.state.timeline);
+    if (clips.length > 0) {
+      console.log(renderTimeline(result.session.state, process.stdout.columns));
+      console.log();
+      console.log(renderClipList(result.session.state));
+      console.log();
+    }
+  });
+
+// ── redo ──────────────────────────────────────────────────────────────────────
+
+program
+  .command("redo")
+  .description("Redo the most recently undone change")
+  .action(async () => {
+    const session = await requireProject();
+
+    const result = redoSession(session);
+    if (!result.ok) {
+      console.error(chalk.yellow("Nothing to redo."));
+      process.exit(0);
+    }
+
+    await saveOrExit(result.session);
+
+    console.log();
+    console.log(chalk.green(`Redid: ${result.label}`));
+    console.log();
+    const clips = clipsInOrder(result.session.state.timeline);
+    if (clips.length > 0) {
+      console.log(renderTimeline(result.session.state, process.stdout.columns));
+      console.log();
+      console.log(renderClipList(result.session.state));
+      console.log();
+    }
   });
 
 // ── export ────────────────────────────────────────────────────────────────────
@@ -245,17 +321,9 @@ program
   .command("export <output>")
   .description("Export the project timeline to a video file")
   .action(async (output: string) => {
-    const ctx = await loadOrCreateProject();
-    if (!ctx.ok) {
-      console.error(chalk.red(`Error: ${ctx.error}`));
-      process.exit(1);
-    }
-    if (!ctx.existed) {
-      console.error(chalk.red("Error: No project found. Run `cutcli open <file>` first."));
-      process.exit(1);
-    }
+    const session = await requireProject();
 
-    const { state } = ctx;
+    const { state } = session;
     const clips = clipsInOrder(state.timeline);
 
     if (clips.length === 0) {
@@ -351,6 +419,27 @@ program
 program.parse();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+async function requireProject(): Promise<ProjectSession> {
+  const ctx = await loadOrCreateProject();
+  if (!ctx.ok) {
+    console.error(chalk.red(`Error: ${ctx.error}`));
+    process.exit(1);
+  }
+  if (!ctx.existed) {
+    console.error(chalk.red("Error: No project found. Run `cutcli open <file>` first."));
+    process.exit(1);
+  }
+  return ctx.session;
+}
+
+async function saveOrExit(session: ProjectSession): Promise<void> {
+  const saved = await saveProjectToStandardPath(session);
+  if (!saved.ok) {
+    console.error(chalk.red(`Error saving project: ${saved.error}`));
+    process.exit(1);
+  }
+}
 
 function formatDuration(seconds: number): string {
   const h = Math.floor(seconds / 3600);

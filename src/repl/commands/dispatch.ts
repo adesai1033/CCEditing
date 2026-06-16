@@ -1,21 +1,26 @@
 import path from "node:path";
 import os from "node:os";
 import { mkdir, unlink } from "node:fs/promises";
-import type { ProjectState } from "../../project/types.js";
-import { clipsInOrder, resolveClip } from "../../project/types.js";
 import type { ViewportState } from "../../display/timeline.js";
 import { buildHelpText } from "./registry.js";
 import { probeFile } from "../../media/probe.js";
 import { renderMediaInfo, formatFileSize } from "../../display/media-info.js";
 import { renderTimeline } from "../../display/timeline.js";
 import { renderClipList } from "../../display/timeline-clip-list.js";
-import { addSource, trimClip, reorderClip, splitClip } from "../../project/mutations.js";
+import { addSource, trimClip, reorderClip, splitClip, removeClip } from "../../project/mutations.js";
+import { clipsInOrder, resolveClip, getClipDisplayRefs } from "../../project/types.js";
+import {
+  applyMutation,
+  undoSession,
+  redoSession,
+  type ProjectSession,
+} from "../../project/session.js";
 import { loadOrCreateProject, saveProjectToStandardPath } from "../../cli/project-context.js";
 import { parseTime } from "../../utils/time.js";
 import { execute } from "../../engine/engine.js";
 
 export interface ReplState {
-  project: ProjectState | null;
+  session: ProjectSession | null;
 }
 
 export interface DispatchResult {
@@ -41,32 +46,18 @@ export async function dispatch(
   const cmd = token?.toLowerCase();
 
   switch (cmd) {
-    case "help":
-      return { output: buildHelpText(), isError: false };
-
-    case "quit":
-      return { output: "Goodbye.", isError: false, shouldExit: true };
-
-    case "open":
-      return dispatchOpen(args, state);
-
-    case "timeline":
-      return dispatchTimeline(state, viewport);
-
-    case "trim":
-      return dispatchTrim(args, state);
-
-    case "move":
-      return dispatchMove(args, state);
-
-    case "split":
-      return dispatchSplit(args, state);
-
-    case "export":
-      return dispatchExport(args, state);
-
-    default:
-      return { output: `Unknown command: /${cmd}. Type /help for available commands.`, isError: true };
+    case "help":     return { output: buildHelpText(), isError: false };
+    case "quit":     return { output: "Goodbye.", isError: false, shouldExit: true };
+    case "open":     return dispatchOpen(args, state);
+    case "timeline": return dispatchTimeline(state, viewport);
+    case "trim":     return dispatchTrim(args, state);
+    case "move":     return dispatchMove(args, state);
+    case "split":    return dispatchSplit(args, state);
+    case "delete":   return dispatchDelete(args, state);
+    case "undo":     return dispatchUndo(state);
+    case "redo":     return dispatchRedo(state);
+    case "export":   return dispatchExport(args, state);
+    default:         return { output: `Unknown command: /${cmd}. Type /help for available commands.`, isError: true };
   }
 }
 
@@ -80,45 +71,53 @@ async function dispatchOpen(args: string[], state: ReplState): Promise<DispatchR
   const probe = await probeFile(absPath);
   if (!probe.ok) return { output: `Error: ${probe.error}`, isError: true };
 
-  const ctx = state.project
-    ? { ok: true as const, state: state.project, existed: true }
-    : await loadOrCreateProject();
-  if (!ctx.ok) return { output: `Error: ${ctx.error}`, isError: true };
+  let session: ProjectSession;
+  if (state.session) {
+    session = state.session;
+  } else {
+    const ctx = await loadOrCreateProject();
+    if (!ctx.ok) return { output: `Error: ${ctx.error}`, isError: true };
+    session = ctx.session;
+  }
 
-  const mutation = addSource(ctx.state, probe.data);
-  if (!mutation.ok) return { output: `Error: ${mutation.error}`, isError: true };
+  const result = applyMutation(
+    session,
+    `add source ${probe.data.fileName}`,
+    (s) => addSource(s, probe.data),
+  );
+  if (!result.ok) return { output: `Error: ${result.error}`, isError: true };
 
-  const saved = await saveProjectToStandardPath(mutation.state);
+  const saved = await saveProjectToStandardPath(result.session);
   if (!saved.ok) return { output: `Error saving project: ${saved.error}`, isError: true };
 
-  const clipCount = clipsInOrder(mutation.state.timeline).length;
+  const clipCount = clipsInOrder(result.session.state.timeline).length;
   return {
     output: renderMediaInfo(probe.data) + `\n\nAdded to project  ·  ${clipCount} clip${clipCount === 1 ? "" : "s"}`,
     isError: false,
-    newState: { project: mutation.state },
+    newState: { session: result.session },
   };
 }
 
 // ── /timeline ─────────────────────────────────────────────────────────────────
 
 function dispatchTimeline(state: ReplState, viewport?: ViewportState): DispatchResult {
-  if (!state.project || state.project.timeline.headId === null) {
+  if (!state.session || state.session.state.timeline.headId === null) {
     return { output: "No clips on timeline. Use /open to add a file.", isError: true };
   }
-  const rendered = renderTimeline(state.project, process.stdout.columns, viewport)
-    + "\n" + renderClipList(state.project);
+  const rendered = renderTimeline(state.session.state, process.stdout.columns, viewport)
+    + "\n" + renderClipList(state.session.state);
   return { output: rendered, isError: false, activatesTimeline: true };
 }
 
 // ── /trim ─────────────────────────────────────────────────────────────────────
 
 async function dispatchTrim(args: string[], state: ReplState): Promise<DispatchResult> {
-  if (!state.project) return { output: "No project open. Use /open first.", isError: true };
+  if (!state.session) return { output: "No project open. Use /open first.", isError: true };
   if (args.length < 3) return { output: "Usage: /trim <index> <start> <end>", isError: true };
 
-  const clip = resolveClip(state.project.timeline, args[0]!);
+  const clip = resolveClip(state.session.state.timeline, args[0]!);
   if (!clip) {
-    const count = clipsInOrder(state.project.timeline).length;
+    const count = clipsInOrder(state.session.state.timeline).length;
     return { output: `Clip "${args[0]}" not found (1–${count})`, isError: true };
   }
 
@@ -130,60 +129,70 @@ async function dispatchTrim(args: string[], state: ReplState): Promise<DispatchR
     return { output: `Error: ${(e as Error).message}`, isError: true };
   }
 
-  const mutation = trimClip(state.project, clip.id, { inPoint, outPoint });
-  if (!mutation.ok) return { output: `Error: ${mutation.error}`, isError: true };
+  const ref = getClipDisplayRefs(state.session.state.timeline).get(clip.id) ?? args[0]!;
+  const result = applyMutation(
+    state.session,
+    `trim clip [${ref}]`,
+    (s) => trimClip(s, clip.id, { inPoint, outPoint }),
+  );
+  if (!result.ok) return { output: `Error: ${result.error}`, isError: true };
 
-  const saved = await saveProjectToStandardPath(mutation.state);
+  const saved = await saveProjectToStandardPath(result.session);
   if (!saved.ok) return { output: `Error saving project: ${saved.error}`, isError: true };
 
-  const trimmed = mutation.state.timeline.clips[clip.id]!;
+  const trimmed = result.session.state.timeline.clips[clip.id]!;
   return {
     output: `Trimmed ${trimmed.label}  ${args[1]} → ${args[2]}  (${formatSeconds(trimmed.outPoint - trimmed.inPoint)})`,
     isError: false,
-    newState: { project: mutation.state },
+    newState: { session: result.session },
   };
 }
 
 // ── /move ─────────────────────────────────────────────────────────────────────
 
 async function dispatchMove(args: string[], state: ReplState): Promise<DispatchResult> {
-  if (!state.project) return { output: "No project open. Use /open first.", isError: true };
+  if (!state.session) return { output: "No project open. Use /open first.", isError: true };
   if (args.length < 2) return { output: "Usage: /move <from> <to>", isError: true };
 
-  const clip = resolveClip(state.project.timeline, args[0]!);
+  const clip = resolveClip(state.session.state.timeline, args[0]!);
   if (!clip) {
-    const count = clipsInOrder(state.project.timeline).length;
+    const count = clipsInOrder(state.session.state.timeline).length;
     return { output: `Clip "${args[0]}" not found (1–${count})`, isError: true };
   }
 
   const toIdx = parseInt(args[1]!, 10) - 1;
-  const count = clipsInOrder(state.project.timeline).length;
+  const count = clipsInOrder(state.session.state.timeline).length;
   if (isNaN(toIdx) || toIdx < 0 || toIdx >= count) {
     return { output: `To-index ${args[1]} out of range (1–${count})`, isError: true };
   }
 
-  const mutation = reorderClip(state.project, clip.id, toIdx);
-  if (!mutation.ok) return { output: `Error: ${mutation.error}`, isError: true };
+  const ref = getClipDisplayRefs(state.session.state.timeline).get(clip.id) ?? args[0]!;
+  const result = applyMutation(
+    state.session,
+    `move clip [${ref}] → position ${args[1]}`,
+    (s) => reorderClip(s, clip.id, toIdx),
+  );
+  if (!result.ok) return { output: `Error: ${result.error}`, isError: true };
 
-  const saved = await saveProjectToStandardPath(mutation.state);
+  const saved = await saveProjectToStandardPath(result.session);
   if (!saved.ok) return { output: `Error saving project: ${saved.error}`, isError: true };
 
   return {
     output: `Moved ${clip.label} → position [${args[1]}]`,
     isError: false,
-    newState: { project: mutation.state },
+    newState: { session: result.session },
   };
 }
 
 // ── /split ────────────────────────────────────────────────────────────────────
 
 async function dispatchSplit(args: string[], state: ReplState): Promise<DispatchResult> {
-  if (!state.project) return { output: "No project open. Use /open first.", isError: true };
+  if (!state.session) return { output: "No project open. Use /open first.", isError: true };
   if (args.length < 2) return { output: "Usage: /split <clip> <time>", isError: true };
 
-  const clip = resolveClip(state.project.timeline, args[0]!);
+  const clip = resolveClip(state.session.state.timeline, args[0]!);
   if (!clip) {
-    const count = clipsInOrder(state.project.timeline).length;
+    const count = clipsInOrder(state.session.state.timeline).length;
     return { output: `Clip "${args[0]}" not found (1–${count})`, isError: true };
   }
 
@@ -194,32 +203,107 @@ async function dispatchSplit(args: string[], state: ReplState): Promise<Dispatch
     return { output: `Error: ${(e as Error).message}`, isError: true };
   }
 
-  const mutation = splitClip(state.project, clip.id, splitPoint);
-  if (!mutation.ok) return { output: `Error: ${mutation.error}`, isError: true };
+  const ref = getClipDisplayRefs(state.session.state.timeline).get(clip.id) ?? args[0]!;
+  const result = applyMutation(
+    state.session,
+    `split clip [${ref}] at ${args[1]}`,
+    (s) => splitClip(s, clip.id, splitPoint),
+  );
+  if (!result.ok) return { output: `Error: ${result.error}`, isError: true };
 
-  const saved = await saveProjectToStandardPath(mutation.state);
+  const saved = await saveProjectToStandardPath(result.session);
   if (!saved.ok) return { output: `Error saving project: ${saved.error}`, isError: true };
 
-  const ordered = clipsInOrder(mutation.state.timeline);
-  const idx = ordered.findIndex((c) => c.id === clip.id);
+  const displayRefs = getClipDisplayRefs(result.session.state.timeline);
+  const ordered = clipsInOrder(result.session.state.timeline);
+  const newSecondClip = ordered[ordered.findIndex((c) => c.id === clip.id) + 1]!;
+  const refA = displayRefs.get(clip.id) ?? "?";
+  const refB = displayRefs.get(newSecondClip.id) ?? "?";
   return {
-    output: `Split ${clip.label} at ${args[1]} → clips [${idx + 1}] and [${idx + 2}]`,
+    output: `Split ${clip.label} at ${args[1]} → clips [${refA}] and [${refB}]`,
     isError: false,
-    newState: { project: mutation.state },
+    newState: { session: result.session },
+  };
+}
+
+// ── /delete ───────────────────────────────────────────────────────────────────
+
+async function dispatchDelete(args: string[], state: ReplState): Promise<DispatchResult> {
+  if (!state.session) return { output: "No project open. Use /open first.", isError: true };
+  if (!args[0]) return { output: "Usage: /delete <clip>", isError: true };
+
+  const clip = resolveClip(state.session.state.timeline, args[0]);
+  if (!clip) {
+    const count = clipsInOrder(state.session.state.timeline).length;
+    return { output: `Clip "${args[0]}" not found (1–${count})`, isError: true };
+  }
+
+  const ref = getClipDisplayRefs(state.session.state.timeline).get(clip.id) ?? args[0];
+  const result = applyMutation(
+    state.session,
+    `delete clip [${ref}]`,
+    (s) => removeClip(s, clip.id),
+  );
+  if (!result.ok) return { output: `Error: ${result.error}`, isError: true };
+
+  const saved = await saveProjectToStandardPath(result.session);
+  if (!saved.ok) return { output: `Error saving project: ${saved.error}`, isError: true };
+
+  const remaining = clipsInOrder(result.session.state.timeline).length;
+  return {
+    output: `Deleted ${clip.label}  ·  ${remaining} clip${remaining === 1 ? "" : "s"} remaining`,
+    isError: false,
+    newState: { session: result.session },
+  };
+}
+
+// ── /undo ─────────────────────────────────────────────────────────────────────
+
+async function dispatchUndo(state: ReplState): Promise<DispatchResult> {
+  if (!state.session) return { output: "No project open. Use /open first.", isError: true };
+
+  const result = undoSession(state.session);
+  if (!result.ok) return { output: "Nothing to undo.", isError: false };
+
+  const saved = await saveProjectToStandardPath(result.session);
+  if (!saved.ok) return { output: `Error saving project: ${saved.error}`, isError: true };
+
+  return {
+    output: `Undid: ${result.label}`,
+    isError: false,
+    newState: { session: result.session },
+  };
+}
+
+// ── /redo ─────────────────────────────────────────────────────────────────────
+
+async function dispatchRedo(state: ReplState): Promise<DispatchResult> {
+  if (!state.session) return { output: "No project open. Use /open first.", isError: true };
+
+  const result = redoSession(state.session);
+  if (!result.ok) return { output: "Nothing to redo.", isError: false };
+
+  const saved = await saveProjectToStandardPath(result.session);
+  if (!saved.ok) return { output: `Error saving project: ${saved.error}`, isError: true };
+
+  return {
+    output: `Redid: ${result.label}`,
+    isError: false,
+    newState: { session: result.session },
   };
 }
 
 // ── /export ───────────────────────────────────────────────────────────────────
 
 async function dispatchExport(args: string[], state: ReplState): Promise<DispatchResult> {
-  if (!state.project) return { output: "No project open. Use /open first.", isError: true };
+  if (!state.session) return { output: "No project open. Use /open first.", isError: true };
   if (!args[0]) return { output: "Usage: /export <output-file>", isError: true };
 
-  const clips = clipsInOrder(state.project.timeline);
+  const clips = clipsInOrder(state.session.state.timeline);
   if (clips.length === 0) return { output: "Timeline is empty. Use /open to add clips.", isError: true };
 
   const outputPath = path.resolve(args[0]);
-  const sourceMap = new Map(state.project.sources.map((s) => [s.id, s]));
+  const sourceMap = new Map(state.session.state.sources.map((s) => [s.id, s]));
 
   // Single clip — direct trim
   if (clips.length === 1) {
