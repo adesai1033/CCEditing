@@ -69,5 +69,69 @@ export async function describeVideo(filePath: string): Promise<string> {
   return text.trim();
 }
 
-export const realBackend = { describeVideo };
+/**
+ * Describe a specific time window of a video using Gemini's videoMetadata
+ * offset feature — the model only analyzes frames inside [startSec, endSec].
+ * Use this AFTER find_visual_moment locates a candidate window so the agent
+ * can reason about what's actually there.
+ */
+export async function describeVideoSegment(
+  filePath: string,
+  startSec: number,
+  endSec: number,
+): Promise<string> {
+  if (endSec <= startSec) {
+    throw new Error(`Invalid segment: end (${endSec}) must be greater than start (${startSec})`);
+  }
+  const g = ai();
+
+  const file = await g.files.upload({
+    file: filePath,
+    config: { mimeType: "video/mp4" },
+  });
+  let active = file;
+  for (let i = 0; i < 60 && active.state !== "ACTIVE"; i++) {
+    if (active.state === "FAILED") {
+      throw new Error(`Gemini Files API failed to process ${filePath}`);
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+    active = await g.files.get({ name: active.name! });
+  }
+  if (active.state !== "ACTIVE") {
+    throw new Error(`Gemini Files API timed out processing ${filePath}`);
+  }
+
+  const response = await g.models.generateContent({
+    model: DESCRIBE_MODEL,
+    contents: [
+      {
+        role: "user",
+        parts: [
+          {
+            fileData: { mimeType: active.mimeType!, fileUri: active.uri! },
+            videoMetadata: {
+              startOffset: `${startSec}s`,
+              endOffset: `${endSec}s`,
+            },
+          },
+          {
+            text:
+              `Describe what happens in this video segment (${startSec}s to ${endSec}s) ` +
+              "in 2-3 sentences. Focus on concrete actions, subjects, and setting — " +
+              "the kind of description an editor would use to decide whether to " +
+              "include this exact window in a narrative.",
+          },
+        ],
+      },
+    ],
+  });
+
+  const text = response.text;
+  if (!text || text.trim().length === 0) {
+    throw new Error(`Gemini returned an empty description for segment ${startSec}-${endSec}s of ${filePath}`);
+  }
+  return text.trim();
+}
+
+export const realBackend = { describeVideo, describeVideoSegment };
 export type GeminiBackend = typeof realBackend;

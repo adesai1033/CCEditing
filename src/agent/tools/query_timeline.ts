@@ -10,11 +10,21 @@ export interface QueryTimelineOutput {
     ref: string;           // display ref ("1", "2a") — for user-facing output
     sourceId: string;
     sourceFileName: string;
+    sourceDuration: number;       // duration of the source file (clip is a window into this)
     inPoint: number;
     outPoint: number;
     duration: number;
     label: string;
     sourceDescription: string | null;  // populated if describe_clip has run
+    // Media constraints — lets the agent reject impossible requests (e.g.
+    // "remove the silent part" on a source with audioCodec === null) and
+    // flag mismatches when combining clips of different resolution/fps.
+    width: number;
+    height: number;
+    fps: number;
+    videoCodec: string;
+    audioPresent: boolean;
+    audioCodec: string | null;
   }>;
 }
 
@@ -30,11 +40,18 @@ async function execute(state: ProjectState, _input: QueryTimelineInput): Promise
       ref: refs.get(c.id) ?? "?",
       sourceId: c.sourceId,
       sourceFileName: source?.fileName ?? "(missing)",
+      sourceDuration: source?.duration ?? 0,
       inPoint: c.inPoint,
       outPoint: c.outPoint,
       duration: c.outPoint - c.inPoint,
       label: c.label,
       sourceDescription: source?.analyses.description?.text ?? null,
+      width: source?.width ?? 0,
+      height: source?.height ?? 0,
+      fps: source?.fps ?? 0,
+      videoCodec: source?.videoCodec ?? "",
+      audioPresent: source?.audioCodec !== null && source?.audioCodec !== undefined,
+      audioCodec: source?.audioCodec ?? null,
     };
   });
 
@@ -47,9 +64,10 @@ const schema: ToolSchema = {
   name: "query_timeline",
   description:
     "Returns the current timeline as an ordered list of clips with display refs " +
-    "(e.g. '1', '2a'), source filenames, in/out points, durations, and cached " +
-    "Gemini descriptions if available. Call this first when planning edits so " +
-    "you know what clips exist and what content they hold.",
+    "(e.g. '1', '2a'), source filenames, in/out points, durations, cached Gemini " +
+    "descriptions if available, plus media constraints per source (resolution, " +
+    "fps, codecs, audio presence). Call this first when planning edits so you " +
+    "know what clips exist, what content they hold, and what's technically possible.",
   input_schema: { type: "object", properties: {} },
 };
 

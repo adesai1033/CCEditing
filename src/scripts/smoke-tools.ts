@@ -16,6 +16,7 @@ import { addSource } from "../project/mutations.js";
 
 import { queryTimeline } from "../agent/tools/query_timeline.js";
 import { describeClip } from "../agent/tools/describe_clip.js";
+import { describeSegment } from "../agent/tools/describe_segment.js";
 import { detectScenes } from "../agent/tools/detect_scenes.js";
 import { findVisualMoment } from "../agent/tools/find_visual_moment.js";
 
@@ -63,8 +64,18 @@ async function main(): Promise<void> {
     console.log("\n── describe_clip (cache hit) ──");
     const dc2 = await describeClip.execute(state, { sourceId });
     console.log(JSON.stringify(dc2, null, 2));
+
+    const half = Math.max(1, Math.floor(probe.data.duration / 2));
+    console.log(`\n── describe_segment 0-${half}s (Gemini, first window) ──`);
+    const ds1 = await describeSegment.execute(state, { sourceId, start: 0, end: half });
+    console.log(JSON.stringify(ds1, null, 2));
+    if (ds1.ok && ds1.stateUpdate) state = ds1.stateUpdate;
+
+    console.log(`\n── describe_segment 0-${half}s (cache hit) ──`);
+    const ds2 = await describeSegment.execute(state, { sourceId, start: 0, end: half });
+    console.log(JSON.stringify(ds2, null, 2));
   } else {
-    console.log("\n── describe_clip: skipped (GEMINI_API_KEY not set) ──");
+    console.log("\n── describe_clip + describe_segment: skipped (GEMINI_API_KEY not set) ──");
   }
 
   if (process.env["TWELVELABS_API_KEY"]) {

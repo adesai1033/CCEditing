@@ -36,12 +36,21 @@ export interface SourceAnalyses {
     detectedAt: string;
   };
   moments?: MomentCacheEntry[];
+  segmentDescriptions?: SegmentDescriptionEntry[];
 }
 
 export interface MomentCacheEntry {
   query: string;
   hits: Array<{ start: number; end: number; confidence: number }>;
   retrievedAt: string;
+}
+
+export interface SegmentDescriptionEntry {
+  start: number;
+  end: number;
+  text: string;
+  model: string;
+  generatedAt: string;
 }
 
 export interface Clip {

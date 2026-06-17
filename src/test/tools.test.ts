@@ -9,6 +9,7 @@ import type { MediaInfo } from "../media/types.js";
 import { queryTimeline } from "../agent/tools/query_timeline.js";
 import { executeFindVisualMoment } from "../agent/tools/find_visual_moment.js";
 import { executeDescribeClip } from "../agent/tools/describe_clip.js";
+import { executeDescribeSegment } from "../agent/tools/describe_segment.js";
 import { executeDetectScenes, parseSceneBoundaries } from "../agent/tools/detect_scenes.js";
 import type { TwelveLabsBackend } from "../agent/backends/twelvelabs.js";
 import type { GeminiBackend } from "../agent/backends/gemini.js";
@@ -50,7 +51,6 @@ describe("query_timeline", () => {
 
   test("returns clips with refs, UUIDs, and source descriptions", async () => {
     let { state, source } = stateWithOneSource();
-    // Attach a cached description to the source
     state = {
       ...state,
       sources: [{
@@ -71,6 +71,32 @@ describe("query_timeline", () => {
     assert.equal(c.sourceDescription, "a hike");
     assert.equal(c.duration, 120);
     assert.equal(r.result.totalDuration, 120);
+  });
+
+  test("exposes media constraints (resolution, fps, codecs, audio presence)", async () => {
+    const { state } = stateWithOneSource();
+    const r = await queryTimeline.execute(state, {});
+    assert.ok(r.ok);
+    const c = r.result.clips[0]!;
+    assert.equal(c.width, 1920);
+    assert.equal(c.height, 1080);
+    assert.equal(c.fps, 30);
+    assert.equal(c.videoCodec, "h264");
+    assert.equal(c.audioPresent, true);
+    assert.equal(c.audioCodec, "aac");
+    assert.equal(c.sourceDuration, 120);
+  });
+
+  test("audioPresent === false when source has no audio track", async () => {
+    let state = createProject("test");
+    const r0 = addSource(state, makeMediaInfo({ audioCodec: null }));
+    assert.ok(r0.ok);
+    state = r0.state;
+
+    const r = await queryTimeline.execute(state, {});
+    assert.ok(r.ok);
+    assert.equal(r.result.clips[0]!.audioPresent, false);
+    assert.equal(r.result.clips[0]!.audioCodec, null);
   });
 
   test("exposes a schema matching Anthropic tool-use shape", () => {
@@ -203,6 +229,7 @@ describe("describe_clip", () => {
         calledFor = filePath;
         return "A two-minute clip showing a person walking through a forest.";
       },
+      describeVideoSegment: async () => { throw new Error("wrong backend method"); },
     };
 
     const r = await executeDescribeClip(state, { sourceId: source.id }, backend);
@@ -227,6 +254,7 @@ describe("describe_clip", () => {
     let called = false;
     const backend: GeminiBackend = {
       describeVideo: async () => { called = true; throw new Error("should not be called"); },
+      describeVideoSegment: async () => { throw new Error("should not be called"); },
     };
 
     const r = await executeDescribeClip(state, { sourceId: source.id }, backend);
@@ -241,8 +269,131 @@ describe("describe_clip", () => {
     const { state, source } = stateWithOneSource();
     const backend: GeminiBackend = {
       describeVideo: async () => { throw new Error("rate limited"); },
+      describeVideoSegment: async () => { throw new Error("rate limited"); },
     };
     const r = await executeDescribeClip(state, { sourceId: source.id }, backend);
+    assert.ok(!r.ok);
+    assert.match(r.error, /rate limited/);
+  });
+});
+
+// ── describe_segment ─────────────────────────────────────────────────────────
+
+describe("describe_segment", () => {
+  test("returns error for unknown sourceId", async () => {
+    const { state } = stateWithOneSource();
+    const r = await executeDescribeSegment(state, { sourceId: "nope", start: 0, end: 5 });
+    assert.ok(!r.ok);
+    assert.match(r.error, /not found/);
+  });
+
+  test("rejects window where end <= start", async () => {
+    const { state, source } = stateWithOneSource();
+    const r = await executeDescribeSegment(state, { sourceId: source.id, start: 10, end: 10 });
+    assert.ok(!r.ok);
+    assert.match(r.error, /must be greater/);
+  });
+
+  test("rejects window outside source duration", async () => {
+    const { state, source } = stateWithOneSource();
+    const r = await executeDescribeSegment(state, { sourceId: source.id, start: 0, end: 999 });
+    assert.ok(!r.ok);
+    assert.match(r.error, /outside the source duration/);
+  });
+
+  test("rejects negative start", async () => {
+    const { state, source } = stateWithOneSource();
+    const r = await executeDescribeSegment(state, { sourceId: source.id, start: -1, end: 10 });
+    assert.ok(!r.ok);
+    assert.match(r.error, /outside the source duration/);
+  });
+
+  test("populates cache on first call with window-bounded result", async () => {
+    const { state, source } = stateWithOneSource();
+    let calledWith: { filePath: string; start: number; end: number } | null = null;
+    const backend: GeminiBackend = {
+      describeVideo: async () => { throw new Error("wrong backend method"); },
+      describeVideoSegment: async (filePath, start, end) => {
+        calledWith = { filePath, start, end };
+        return "A river crossing — careful step-by-step movement across rocks.";
+      },
+    };
+
+    const r = await executeDescribeSegment(state, { sourceId: source.id, start: 25, end: 32 }, backend);
+    assert.ok(r.ok);
+    assert.equal(calledWith!.filePath, source.filePath);
+    assert.equal(calledWith!.start, 25);
+    assert.equal(calledWith!.end, 32);
+    assert.equal(r.result.cached, false);
+    assert.equal(r.result.start, 25);
+    assert.equal(r.result.end, 32);
+    assert.match(r.result.description, /river/);
+    const cached = r.stateUpdate!.sources[0]!.analyses.segmentDescriptions!;
+    assert.equal(cached.length, 1);
+    assert.equal(cached[0]!.start, 25);
+    assert.equal(cached[0]!.end, 32);
+  });
+
+  test("cache hit on second call with same (start, end) — no backend call", async () => {
+    let { state, source } = stateWithOneSource();
+    state = {
+      ...state,
+      sources: [{
+        ...source,
+        analyses: {
+          segmentDescriptions: [
+            { start: 25, end: 32, text: "stored", model: "gemini-2.5-flash", generatedAt: "x" },
+          ],
+        },
+      }],
+    };
+    let called = false;
+    const backend: GeminiBackend = {
+      describeVideo: async () => { throw new Error("should not be called"); },
+      describeVideoSegment: async () => { called = true; throw new Error("should not be called"); },
+    };
+
+    const r = await executeDescribeSegment(state, { sourceId: source.id, start: 25, end: 32 }, backend);
+    assert.ok(r.ok);
+    assert.equal(called, false);
+    assert.equal(r.result.cached, true);
+    assert.equal(r.result.description, "stored");
+    assert.equal(r.stateUpdate, undefined);
+  });
+
+  test("different window on same source: still calls backend (cache miss)", async () => {
+    let { state, source } = stateWithOneSource();
+    state = {
+      ...state,
+      sources: [{
+        ...source,
+        analyses: {
+          segmentDescriptions: [
+            { start: 25, end: 32, text: "stored", model: "gemini-2.5-flash", generatedAt: "x" },
+          ],
+        },
+      }],
+    };
+    const backend: GeminiBackend = {
+      describeVideo: async () => { throw new Error("wrong method"); },
+      describeVideoSegment: async () => "second window",
+    };
+
+    const r = await executeDescribeSegment(state, { sourceId: source.id, start: 40, end: 50 }, backend);
+    assert.ok(r.ok);
+    assert.equal(r.result.cached, false);
+    // Both entries now cached
+    const cached = r.stateUpdate!.sources[0]!.analyses.segmentDescriptions!;
+    assert.equal(cached.length, 2);
+  });
+
+  test("propagates backend error", async () => {
+    const { state, source } = stateWithOneSource();
+    const backend: GeminiBackend = {
+      describeVideo: async () => { throw new Error("wrong"); },
+      describeVideoSegment: async () => { throw new Error("rate limited"); },
+    };
+    const r = await executeDescribeSegment(state, { sourceId: source.id, start: 0, end: 10 }, backend);
     assert.ok(!r.ok);
     assert.match(r.error, /rate limited/);
   });
@@ -341,9 +492,10 @@ describe("tool schemas", () => {
   test("every tool exposes a name, description, and input_schema", async () => {
     const { findVisualMoment } = await import("../agent/tools/find_visual_moment.js");
     const { describeClip } = await import("../agent/tools/describe_clip.js");
+    const { describeSegment } = await import("../agent/tools/describe_segment.js");
     const { detectScenes } = await import("../agent/tools/detect_scenes.js");
 
-    for (const tool of [queryTimeline, findVisualMoment, describeClip, detectScenes]) {
+    for (const tool of [queryTimeline, findVisualMoment, describeClip, describeSegment, detectScenes]) {
       assert.ok(tool.schema.name.length > 0);
       assert.ok(tool.schema.description.length > 30, `${tool.schema.name} description too short`);
       assert.equal(tool.schema.input_schema.type, "object");
