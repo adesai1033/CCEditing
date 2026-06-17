@@ -1,5 +1,5 @@
+import { z } from "zod";
 import type { ProjectState, MutationResult } from "./types.js";
-import type { MediaInfo } from "../media/types.js";
 import { addSource, trimClip, splitClip, reorderClip, removeClip } from "./mutations.js";
 
 // A point-in-time snapshot of project state, tagged with the action that
@@ -20,14 +20,58 @@ export interface ProjectSession {
 }
 
 // The unified operation vocabulary. Every state change — slash command or
-// agent turn — is one of these. The agent's propose_edit_plan tool emits this
-// shape directly so its output flows straight into applyPlan.
-export type Operation =
-  | { type: "addSource"; mediaInfo: MediaInfo }
-  | { type: "trim"; clipId: string; inPoint?: number; outPoint?: number }
-  | { type: "split"; clipId: string; splitPoint: number }
-  | { type: "move"; clipId: string; newIndex: number }
-  | { type: "delete"; clipId: string };
+// agent turn — is one of these. The agent's propose_edit_plan tool emits a
+// SUBSET of this shape (everything except addSource) so its output flows
+// straight into applyPlan.
+//
+// This zod schema is the single source of truth: the TS Operation type is
+// derived from it, and the agent's tool JSON Schema is derived from a subset
+// of it via zod-to-json-schema. Adding a field here updates both downstream.
+
+// addSource carries the full MediaInfo from the probe. MediaInfo is a
+// closed shape defined elsewhere; we don't restate its fields in zod, we
+// just accept it as an opaque object on the operation. (The agent's
+// propose_edit_plan does NOT include addSource — file imports stay in /open
+// — so this branch is only used by the CLI/REPL slash dispatchers, which
+// always construct it with a real MediaInfo. No schema validation needed.)
+const AddSourceOp = z.object({
+  type: z.literal("addSource"),
+  mediaInfo: z.unknown(),
+});
+
+export const TrimOpSchema = z.object({
+  type: z.literal("trim"),
+  clipId: z.string(),
+  inPoint: z.number().optional(),
+  outPoint: z.number().optional(),
+});
+
+export const SplitOpSchema = z.object({
+  type: z.literal("split"),
+  clipId: z.string(),
+  splitPoint: z.number(),
+});
+
+export const MoveOpSchema = z.object({
+  type: z.literal("move"),
+  clipId: z.string(),
+  newIndex: z.number().int(),
+});
+
+export const DeleteOpSchema = z.object({
+  type: z.literal("delete"),
+  clipId: z.string(),
+});
+
+export const OperationSchema = z.discriminatedUnion("type", [
+  AddSourceOp,
+  TrimOpSchema,
+  SplitOpSchema,
+  MoveOpSchema,
+  DeleteOpSchema,
+]);
+
+export type Operation = z.infer<typeof OperationSchema>;
 
 export type ApplyResult =
   | { ok: true; session: ProjectSession }
@@ -85,7 +129,9 @@ export function applyPlan(
 function executeOperation(state: ProjectState, op: Operation): MutationResult {
   switch (op.type) {
     case "addSource":
-      return addSource(state, op.mediaInfo);
+      // mediaInfo is typed as `unknown` on the zod schema (see note above);
+      // slash dispatchers always pass a real MediaInfo, so the cast is safe.
+      return addSource(state, op.mediaInfo as Parameters<typeof addSource>[1]);
     case "trim":
       return trimClip(state, op.clipId, { inPoint: op.inPoint, outPoint: op.outPoint });
     case "split":

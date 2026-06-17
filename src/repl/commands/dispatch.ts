@@ -1,6 +1,7 @@
 import path from "node:path";
 import os from "node:os";
 import { mkdir, unlink } from "node:fs/promises";
+import type Anthropic from "@anthropic-ai/sdk";
 import type { ViewportState } from "../../display/timeline.js";
 import { buildHelpText } from "./registry.js";
 import { probeFile } from "../../media/probe.js";
@@ -17,9 +18,13 @@ import {
 import { loadOrCreateProject, saveProjectToStandardPath } from "../../cli/project-context.js";
 import { parseTime } from "../../utils/time.js";
 import { execute } from "../../engine/engine.js";
+import { runAgent, type AgentInput, type ProgressEvent } from "../../agent/loop.js";
+import type { PlanForConfirmation } from "../../agent/propose_edit_plan.js";
 
 export interface ReplState {
   session: ProjectSession | null;
+  messages: Anthropic.Messages.MessageParam[];
+  autoApprove: boolean;
 }
 
 export interface DispatchResult {
@@ -30,15 +35,32 @@ export interface DispatchResult {
   activatesTimeline?: boolean;
 }
 
+export type ConfirmFn = (plan: PlanForConfirmation) => Promise<{ approved: boolean }>;
+
+export interface DispatchOptions {
+  viewport?: ViewportState;
+  /** Required for non-slash (agent) input. */
+  confirm?: ConfirmFn;
+  /** Optional progress hook so the REPL can render tool calls inline. */
+  onAgentProgress?: (event: ProgressEvent) => void;
+  /** Injected for tests — defaults to runAgent. */
+  agent?: (input: AgentInput) => Promise<{
+    messages: Anthropic.Messages.MessageParam[];
+    session: ProjectSession;
+    output: string;
+    isError: boolean;
+  }>;
+}
+
 export async function dispatch(
   raw: string,
   state: ReplState,
-  viewport?: ViewportState,
+  options: DispatchOptions = {},
 ): Promise<DispatchResult> {
   const trimmed = raw.trim();
 
   if (!trimmed.startsWith("/")) {
-    return { output: "Unknown input. Type /help to see available commands.", isError: true };
+    return dispatchAgent(trimmed, state, options);
   }
 
   const [token, ...args] = trimmed.slice(1).split(/\s+/);
@@ -47,17 +69,59 @@ export async function dispatch(
   switch (cmd) {
     case "help":     return { output: buildHelpText(), isError: false };
     case "quit":     return { output: "Goodbye.", isError: false, shouldExit: true };
-    case "open":     return dispatchOpen(args, state);
-    case "timeline": return dispatchTimeline(state, viewport);
-    case "trim":     return dispatchTrim(args, state);
-    case "move":     return dispatchMove(args, state);
-    case "split":    return dispatchSplit(args, state);
-    case "delete":   return dispatchDelete(args, state);
-    case "undo":     return dispatchUndo(state);
-    case "redo":     return dispatchRedo(state);
+    case "open":     return withSlashContinuity(await dispatchOpen(args, state), state);
+    case "timeline": return dispatchTimeline(state, options.viewport);
+    case "trim":     return withSlashContinuity(await dispatchTrim(args, state), state);
+    case "move":     return withSlashContinuity(await dispatchMove(args, state), state);
+    case "split":    return withSlashContinuity(await dispatchSplit(args, state), state);
+    case "delete":   return withSlashContinuity(await dispatchDelete(args, state), state);
+    case "undo":     return withSlashContinuity(await dispatchUndo(state), state);
+    case "redo":     return withSlashContinuity(await dispatchRedo(state), state);
     case "export":   return dispatchExport(args, state);
+    case "auto":     return dispatchAuto(args, state);
+    case "clear":    return dispatchClear(state);
     default:         return { output: `Unknown command: /${cmd}. Type /help for available commands.`, isError: true };
   }
+}
+
+/**
+ * If a slash command changed project state, append a terse synthetic user
+ * message to the agent's conversation memory so follow-up agent prompts
+ * have intent continuity ("make that trim shorter" after `/trim 1 0:05 0:30`).
+ * Centralized here so every state-mutating command gets it for free.
+ *
+ * Read-only commands (those without newState.session change OR with an
+ * isError) are passed through untouched.
+ */
+function withSlashContinuity(result: DispatchResult, prevState: ReplState): DispatchResult {
+  if (result.isError || !result.newState || result.newState.session === prevState.session) {
+    return result;
+  }
+  const note = synthesizeSlashNote(result.output);
+  if (!note) return result;
+  return {
+    ...result,
+    newState: {
+      ...result.newState,
+      messages: [
+        ...result.newState.messages,
+        { role: "user", content: `(via slash command: ${note})` },
+      ],
+    },
+  };
+}
+
+/**
+ * Derive a one-line factual summary of what the slash command did from its
+ * own output (first non-empty line, dimmed/colored stripped). The output
+ * already says "Trimmed ... 0:05 → 0:30" etc., so we reuse it rather than
+ * threading a structured event from each command.
+ */
+function synthesizeSlashNote(output: string): string {
+  const firstLine = output.split("\n").find((l) => l.trim().length > 0) ?? "";
+  // Remove ANSI escape codes (chalk) and trim
+  const clean = firstLine.replace(/\x1B\[[0-9;]*m/g, "").trim();
+  return clean;
 }
 
 // ── /open ─────────────────────────────────────────────────────────────────────
@@ -93,7 +157,7 @@ async function dispatchOpen(args: string[], state: ReplState): Promise<DispatchR
   return {
     output: renderMediaInfo(probe.data) + `\n\nAdded to project  ·  ${clipCount} clip${clipCount === 1 ? "" : "s"}`,
     isError: false,
-    newState: { session: result.session },
+    newState: { ...state, session: result.session },
   };
 }
 
@@ -143,7 +207,7 @@ async function dispatchTrim(args: string[], state: ReplState): Promise<DispatchR
   return {
     output: `Trimmed ${trimmed.label}  ${args[1]} → ${args[2]}  (${formatSeconds(trimmed.outPoint - trimmed.inPoint)})`,
     isError: false,
-    newState: { session: result.session },
+    newState: { ...state, session: result.session },
   };
 }
 
@@ -179,7 +243,7 @@ async function dispatchMove(args: string[], state: ReplState): Promise<DispatchR
   return {
     output: `Moved ${clip.label} → position [${args[1]}]`,
     isError: false,
-    newState: { session: result.session },
+    newState: { ...state, session: result.session },
   };
 }
 
@@ -221,7 +285,7 @@ async function dispatchSplit(args: string[], state: ReplState): Promise<Dispatch
   return {
     output: `Split ${clip.label} at ${args[1]} → clips [${refA}] and [${refB}]`,
     isError: false,
-    newState: { session: result.session },
+    newState: { ...state, session: result.session },
   };
 }
 
@@ -252,7 +316,7 @@ async function dispatchDelete(args: string[], state: ReplState): Promise<Dispatc
   return {
     output: `Deleted ${clip.label}  ·  ${remaining} clip${remaining === 1 ? "" : "s"} remaining`,
     isError: false,
-    newState: { session: result.session },
+    newState: { ...state, session: result.session },
   };
 }
 
@@ -270,7 +334,7 @@ async function dispatchUndo(state: ReplState): Promise<DispatchResult> {
   return {
     output: `Undid: ${result.label}`,
     isError: false,
-    newState: { session: result.session },
+    newState: { ...state, session: result.session },
   };
 }
 
@@ -288,7 +352,7 @@ async function dispatchRedo(state: ReplState): Promise<DispatchResult> {
   return {
     output: `Redid: ${result.label}`,
     isError: false,
-    newState: { session: result.session },
+    newState: { ...state, session: result.session },
   };
 }
 
@@ -348,6 +412,91 @@ async function dispatchExport(args: string[], state: ReplState): Promise<Dispatc
   return {
     output: `Exported: ${outputPath}\nSize: ${formatFileSize(concat.outputSize)}\nDuration: ${formatDuration(total)}  (${clips.length} clips)`,
     isError: false,
+  };
+}
+
+// ── /auto ─────────────────────────────────────────────────────────────────────
+
+function dispatchAuto(args: string[], state: ReplState): DispatchResult {
+  const arg = args[0]?.toLowerCase();
+  if (!arg) {
+    return {
+      output: `Approve-all mode is ${state.autoApprove ? "on" : "off"}. Use /auto on or /auto off to toggle.`,
+      isError: false,
+    };
+  }
+  if (arg === "on") {
+    return {
+      output: "Approve-all mode: on. The agent will apply plans without confirmation until /auto off.",
+      isError: false,
+      newState: { ...state, autoApprove: true },
+    };
+  }
+  if (arg === "off") {
+    return {
+      output: "Approve-all mode: off. The agent will confirm every plan.",
+      isError: false,
+      newState: { ...state, autoApprove: false },
+    };
+  }
+  return { output: "Usage: /auto [on|off]", isError: true };
+}
+
+// ── /clear ────────────────────────────────────────────────────────────────────
+
+function dispatchClear(state: ReplState): DispatchResult {
+  return {
+    output: "Agent conversation cleared. Project state and undo history are unchanged.",
+    isError: false,
+    newState: { ...state, messages: [] },
+  };
+}
+
+// ── Agent (non-slash input) ───────────────────────────────────────────────────
+
+async function dispatchAgent(
+  prompt: string,
+  state: ReplState,
+  options: DispatchOptions,
+): Promise<DispatchResult> {
+  if (!state.session) {
+    return { output: "No project open. Use /open <file> first.", isError: true };
+  }
+  if (!options.confirm) {
+    return { output: "Internal error: confirm callback not provided.", isError: true };
+  }
+
+  const run = options.agent ?? runAgent;
+  const result = await run({
+    userPrompt: prompt,
+    session: state.session,
+    messages: state.messages,
+    autoApprove: state.autoApprove,
+    confirm: options.confirm,
+    onProgress: options.onAgentProgress,
+  });
+
+  // Persist if anything in the session changed — applyPlan results AND
+  // any analysis cache populated by perception tools during the loop.
+  if (result.session !== state.session) {
+    const saved = await saveProjectToStandardPath(result.session);
+    if (!saved.ok) {
+      return {
+        output: `${result.output}\n\nWarning: failed to save project — ${saved.error}`,
+        isError: true,
+        newState: { ...state, session: result.session, messages: result.messages },
+      };
+    }
+  }
+
+  return {
+    output: result.output,
+    isError: result.isError,
+    newState: {
+      ...state,
+      session: result.session,
+      messages: result.messages,
+    },
   };
 }
 

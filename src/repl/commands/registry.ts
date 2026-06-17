@@ -14,6 +14,8 @@ export const COMMANDS: CommandDef[] = [
   { name: "redo",     syntax: "/redo",                       description: "Redo the most recently undone change" },
   { name: "timeline", syntax: "/timeline",                   description: "Show the current timeline" },
   { name: "export",   syntax: "/export <output>",            description: "Export the timeline to a file" },
+  { name: "auto",     syntax: "/auto [on|off]",              description: "Toggle agent approve-all mode" },
+  { name: "clear",    syntax: "/clear",                      description: "Reset agent conversation memory (state untouched)" },
   { name: "help",     syntax: "/help",                       description: "Show this help message" },
   { name: "quit",     syntax: "/quit",                       description: "Exit CutCLI" },
 ];

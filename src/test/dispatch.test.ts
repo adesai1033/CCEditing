@@ -49,18 +49,18 @@ function makeState(n = 1): ReplState {
     assert.ok(r.ok);
     state = r.state;
   }
-  return { session: createSession(state) };
+  return { session: createSession(state), messages: [], autoApprove: false };
 }
 
-const noProject: ReplState = { session: null };
+const noProject: ReplState = { session: null, messages: [], autoApprove: false };
 
 // ── Routing ───────────────────────────────────────────────────────────────────
 
 describe("dispatch routing", () => {
-  test("non-slash input returns error", async () => {
+  test("non-slash input without project returns friendly error (agent path)", async () => {
     const r = await dispatch("hello", noProject);
     assert.equal(r.isError, true);
-    assert.match(r.output, /Type \/help/);
+    assert.match(r.output, /No project open/);
   });
 
   test("unknown command returns error", async () => {
@@ -96,7 +96,7 @@ describe("/timeline", () => {
   });
 
   test("returns error on empty timeline", async () => {
-    const r = await dispatch("/timeline", { session: createSession(createProject("test")) });
+    const r = await dispatch("/timeline", { session: createSession(createProject("test")), messages: [], autoApprove: false });
     assert.equal(r.isError, true);
   });
 
@@ -319,6 +319,112 @@ describe("/delete", () => {
   });
 });
 
+// ── /auto ─────────────────────────────────────────────────────────────────────
+
+describe("/auto", () => {
+  test("/auto reports current state without args", async () => {
+    const r = await dispatch("/auto", makeState());
+    assert.equal(r.isError, false);
+    assert.match(r.output, /off/);
+  });
+
+  test("/auto on flips autoApprove to true", async () => {
+    const r = await dispatch("/auto on", makeState());
+    assert.equal(r.isError, false);
+    assert.equal(r.newState!.autoApprove, true);
+  });
+
+  test("/auto off flips autoApprove to false", async () => {
+    const state = { ...makeState(), autoApprove: true };
+    const r = await dispatch("/auto off", state);
+    assert.equal(r.isError, false);
+    assert.equal(r.newState!.autoApprove, false);
+  });
+
+  test("/auto with unknown arg returns usage error", async () => {
+    const r = await dispatch("/auto maybe", makeState());
+    assert.equal(r.isError, true);
+    assert.match(r.output, /Usage/);
+  });
+});
+
+// ── /clear ────────────────────────────────────────────────────────────────────
+
+describe("/clear", () => {
+  test("/clear resets messages but preserves session and undo", async () => {
+    const state: ReplState = {
+      ...makeState(),
+      messages: [
+        { role: "user", content: "earlier prompt" },
+      ],
+    };
+    const sessionRef = state.session;
+    const r = await dispatch("/clear", state);
+    assert.equal(r.isError, false);
+    assert.deepEqual(r.newState!.messages, []);
+    assert.equal(r.newState!.session, sessionRef);
+  });
+});
+
+// ── Slash-command continuity (synthetic-message injection) ────────────────────
+
+describe("slash-command continuity", () => {
+  test("/trim injects a synthetic note into agent messages", async () => {
+    const state = makeState();
+    const r = await dispatch("/trim 1 0 30", state);
+    assert.equal(r.isError, false);
+    assert.equal(r.newState!.messages.length, 1);
+    const m = r.newState!.messages[0]!;
+    assert.equal(m.role, "user");
+    assert.match(m.content as string, /via slash command/);
+    assert.match(m.content as string, /Trimmed/);
+  });
+
+  test("/timeline (read-only) does NOT inject a synthetic note", async () => {
+    const r = await dispatch("/timeline", makeState(1));
+    assert.equal(r.isError, false);
+    // Either no newState or unchanged messages
+    if (r.newState) assert.deepEqual(r.newState.messages, []);
+  });
+
+  test("a failed /trim does NOT inject a synthetic note", async () => {
+    const r = await dispatch("/trim 99 0 30", makeState());
+    assert.equal(r.isError, true);
+    if (r.newState) assert.deepEqual(r.newState.messages, []);
+  });
+});
+
+// ── Non-slash routing → agent ─────────────────────────────────────────────────
+
+describe("agent routing", () => {
+  test("non-slash input is routed to the agent with correct args", async () => {
+    let captured: { userPrompt: string; autoApprove: boolean } | null = null;
+    const mockAgent = async (input: import("../agent/loop.js").AgentInput) => {
+      captured = { userPrompt: input.userPrompt, autoApprove: input.autoApprove };
+      return {
+        messages: [...input.messages, { role: "user" as const, content: input.userPrompt }],
+        session: input.session,
+        output: "(mocked)",
+        isError: false,
+      };
+    };
+    const state: ReplState = { ...makeState(), autoApprove: true };
+    const r = await dispatch("trim the boring intro", state, {
+      confirm: async () => ({ approved: true }),
+      agent: mockAgent,
+    });
+    assert.equal(r.isError, false);
+    assert.equal(captured!.userPrompt, "trim the boring intro");
+    assert.equal(captured!.autoApprove, true);
+  });
+
+  test("non-slash with no project returns friendly error", async () => {
+    const r = await dispatch("hello", noProject);
+    assert.equal(r.isError, true);
+    assert.match(r.output, /No project open/);
+  });
+});
+
 // ── /export (error paths only — success requires ffmpeg) ──────────────────────
 
 describe("/export error paths", () => {
@@ -335,7 +441,7 @@ describe("/export error paths", () => {
   });
 
   test("returns error when timeline is empty", async () => {
-    const r = await dispatch("/export out.mp4", { session: createSession(createProject("test")) });
+    const r = await dispatch("/export out.mp4", { session: createSession(createProject("test")), messages: [], autoApprove: false });
     assert.equal(r.isError, true);
     assert.match(r.output, /empty/);
   });

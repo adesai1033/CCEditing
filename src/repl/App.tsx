@@ -1,24 +1,36 @@
 import { useState, useRef, useEffect } from "react";
-import { Box } from "ink";
+import { Box, Text } from "ink";
 import { Header } from "./components/Header.js";
 import { OutputHistory, type HistoryEntry } from "./components/OutputHistory.js";
 import { InputLine } from "./components/InputLine.js";
+import { ConfirmPlan } from "./components/ConfirmPlan.js";
 import { useCommandHistory } from "./hooks/useCommandHistory.js";
 import { dispatch, type ReplState } from "./commands/dispatch.js";
 import { renderTimeline, type ViewportState } from "../display/timeline.js";
 import { renderClipList } from "../display/timeline-clip-list.js";
 import { loadOrCreateProject } from "../cli/project-context.js";
 import { clipsInOrder } from "../project/types.js";
+import type { PlanForConfirmation } from "../agent/propose_edit_plan.js";
+import type { ProgressEvent } from "../agent/loop.js";
 
 export function App() {
   const [entries, setEntries]               = useState<HistoryEntry[]>([]);
-  const [replState, setReplState]           = useState<ReplState>({ session: null });
+  const [replState, setReplState]           = useState<ReplState>({
+    session: null,
+    messages: [],
+    autoApprove: false,
+  });
   const [inputValue, setInputValue]         = useState<string>("");
   const [viewport, setViewport]             = useState<ViewportState | null>(null);
   const [timelineActive, setTimelineActive] = useState<boolean>(false);
   const [pendingEntry, setPendingEntry]     = useState<HistoryEntry | null>(null);
+  // Plan awaiting confirmation; presence puts InputLine in confirm mode.
+  const [pendingPlan, setPendingPlan]       = useState<PlanForConfirmation | null>(null);
 
   const inputHistoryRef = useRef<string[]>([]);
+  // Promise resolver for the agent's `await confirm(plan)`. Set when the agent
+  // calls confirm, cleared when the user answers y/n.
+  const confirmResolverRef = useRef<((decision: { approved: boolean }) => void) | null>(null);
 
   const { navigateUp, navigateDown, resetCursor } = useCommandHistory(
     inputHistoryRef.current,
@@ -33,7 +45,7 @@ export function App() {
       const ctx = await loadOrCreateProject();
       setPendingEntry(null);
       if (ctx.ok && ctx.existed) {
-        setReplState({ session: ctx.session });
+        setReplState((s) => ({ ...s, session: ctx.session }));
         const clipCount = clipsInOrder(ctx.session.state.timeline).length;
         setEntries([{
           id,
@@ -44,6 +56,58 @@ export function App() {
       }
     })();
   }, []);
+
+  // The confirm callback handed to the agent loop. Stashes a resolver,
+  // surfaces the plan to the UI, and waits.
+  function makeConfirmCallback(): (plan: PlanForConfirmation) => Promise<{ approved: boolean }> {
+    return (plan) => new Promise((resolve) => {
+      confirmResolverRef.current = resolve;
+      setPendingPlan(plan);
+    });
+  }
+
+  function handleConfirmAnswer(approved: boolean): void {
+    const resolve = confirmResolverRef.current;
+    confirmResolverRef.current = null;
+    setPendingPlan(null);
+    setEntries((prev) => [...prev, {
+      id: crypto.randomUUID(),
+      input: approved ? "y" : "n",
+      output: approved ? "Approved." : "Rejected.",
+      isError: false,
+    }]);
+    resolve?.({ approved });
+  }
+
+  function handleAgentProgress(event: ProgressEvent): void {
+    // Tool calls render as dim one-liners; assistant text streams through as
+    // soon as it arrives. Errors get a marker.
+    if (event.type === "tool_call") {
+      setEntries((prev) => [...prev, {
+        id: crypto.randomUUID(),
+        input: "",
+        output: `→ ${event.name}(${truncateForProgress(event.input)})`,
+        isError: false,
+        dim: true,
+      }]);
+    } else if (event.type === "tool_result") {
+      const tag = event.ok ? "✓" : "✗";
+      setEntries((prev) => [...prev, {
+        id: crypto.randomUUID(),
+        input: "",
+        output: `${tag} ${event.name} (${event.durationMs}ms)`,
+        isError: !event.ok,
+        dim: true,
+      }]);
+    } else if (event.type === "assistant_text") {
+      setEntries((prev) => [...prev, {
+        id: crypto.randomUUID(),
+        input: "",
+        output: event.text,
+        isError: false,
+      }]);
+    }
+  }
 
   async function handleSubmit(raw: string): Promise<void> {
     const trimmed = raw.trim();
@@ -57,7 +121,11 @@ export function App() {
     const pendingId = crypto.randomUUID();
     setPendingEntry({ id: pendingId, input: trimmed, output: "Running…", isError: false });
 
-    const result = await dispatch(trimmed, replState, viewport ?? undefined);
+    const result = await dispatch(trimmed, replState, {
+      viewport: viewport ?? undefined,
+      confirm: makeConfirmCallback(),
+      onAgentProgress: handleAgentProgress,
+    });
 
     setPendingEntry(null);
     setEntries((prev) => [...prev, {
@@ -122,6 +190,12 @@ export function App() {
     <Box flexDirection="column" height="100%">
       <Header />
       <OutputHistory entries={entries} pendingEntry={pendingEntry} />
+      {pendingPlan && <ConfirmPlan plan={pendingPlan} />}
+      {replState.autoApprove && (
+        <Box paddingX={1}>
+          <Text dimColor>(approve-all mode is on — /auto off to disable)</Text>
+        </Box>
+      )}
       <InputLine
         value={inputValue}
         onChange={(v) => { setTimelineActive(false); setInputValue(v); }}
@@ -131,7 +205,15 @@ export function App() {
         timelineActive={timelineActive}
         onViewportZoom={handleViewportZoom}
         onViewportScroll={handleViewportScroll}
+        confirmMode={pendingPlan !== null}
+        onConfirmAnswer={handleConfirmAnswer}
       />
     </Box>
   );
+}
+
+function truncateForProgress(input: unknown): string {
+  const s = JSON.stringify(input);
+  if (!s) return "";
+  return s.length > 80 ? s.slice(0, 77) + "..." : s;
 }

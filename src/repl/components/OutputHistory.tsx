@@ -5,6 +5,8 @@ export interface HistoryEntry {
   input: string;
   output: string;
   isError: boolean;
+  /** Render this entry's output as dimmed (used for agent tool-call progress lines). */
+  dim?: boolean;
 }
 
 interface Props {
@@ -25,9 +27,9 @@ export function OutputHistory({ entries, pendingEntry }: Props) {
       {entries.length > 0 && (
         <Static items={entries}>
           {(entry) => (
-            <Box key={entry.id} flexDirection="column" paddingX={1} marginBottom={1}>
-              <Text color="green" bold>› {entry.input}</Text>
-              <Text color={entry.isError ? "red" : undefined}>{entry.output}</Text>
+            <Box key={entry.id} flexDirection="column" paddingX={1} marginBottom={entry.dim ? 0 : 1}>
+              {entry.input && <Text color="green" bold>› {entry.input}</Text>}
+              <Text color={entry.isError ? "red" : undefined} dimColor={entry.dim}>{entry.output}</Text>
             </Box>
           )}
         </Static>
