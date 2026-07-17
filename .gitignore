@@ -1,5 +1,9 @@
 node_modules/
 dist/
 .DS_Store
+.env
 *.mp4
-!test-assets/*.mp4
+!test-assets/test.mp4
+
+# Local project state (absolute paths, per-machine)
+.cutcli.json

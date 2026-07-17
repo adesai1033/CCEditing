@@ -1,0 +1,1 @@
+- [CutCLI state model architecture](project_cutcli_architecture.md) — Core architecture, mutation pattern, persistence strategy, and known issues from Slice 3A review
