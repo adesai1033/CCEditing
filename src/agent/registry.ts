@@ -6,6 +6,8 @@ import { describeClip } from "./tools/describe_clip.js";
 import { describeSegment } from "./tools/describe_segment.js";
 import { findVisualMoment } from "./tools/find_visual_moment.js";
 import { detectScenes } from "./tools/detect_scenes.js";
+import { transcribeAudio } from "./tools/transcribe_audio.js";
+import { detectSilence } from "./tools/detect_silence.js";
 import { proposeEditPlanSchema } from "./propose_edit_plan.js";
 
 /**
@@ -62,6 +64,8 @@ export function buildDefaultRegistry(): ToolRegistry {
   r.register(describeSegment);
   r.register(findVisualMoment);
   r.register(detectScenes);
+  r.register(transcribeAudio);
+  r.register(detectSilence);
   return r;
 }
 

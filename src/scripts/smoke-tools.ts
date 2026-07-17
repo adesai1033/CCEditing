@@ -20,6 +20,8 @@ import { describeClip } from "../agent/tools/describe_clip.js";
 import { describeSegment } from "../agent/tools/describe_segment.js";
 import { detectScenes } from "../agent/tools/detect_scenes.js";
 import { findVisualMoment } from "../agent/tools/find_visual_moment.js";
+import { detectSilence } from "../agent/tools/detect_silence.js";
+import { transcribeAudio } from "../agent/tools/transcribe_audio.js";
 
 async function main(): Promise<void> {
   const file = process.argv[2];
@@ -55,6 +57,24 @@ async function main(): Promise<void> {
   const ds = await detectScenes.execute(state, { sourceId });
   console.log(JSON.stringify(ds, null, 2));
   if (ds.ok && ds.stateUpdate) state = ds.stateUpdate;
+
+  console.log("\n── detect_silence (real ffmpeg) ──");
+  const sil = await detectSilence.execute(state, { sourceId });
+  console.log(JSON.stringify(sil, null, 2));
+  if (sil.ok && sil.stateUpdate) state = sil.stateUpdate;
+
+  if (process.env["GEMINI_API_KEY"]) {
+    console.log("\n── transcribe_audio (overview — must NOT dump the transcript) ──");
+    const ov = await transcribeAudio.execute(state, { sourceId });
+    console.log(JSON.stringify(ov, null, 2));
+    if (ov.ok && ov.stateUpdate) state = ov.stateUpdate;
+
+    console.log("\n── transcribe_audio (window 0-8s, cache hit) ──");
+    const win = await transcribeAudio.execute(state, { sourceId, start: 0, end: 8 });
+    console.log(JSON.stringify(win, null, 2));
+  } else {
+    console.log("\n── transcribe_audio: skipped (GEMINI_API_KEY not set) ──");
+  }
 
   if (process.env["GEMINI_API_KEY"]) {
     console.log("\n── describe_clip (Gemini, first call) ──");

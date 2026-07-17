@@ -3,6 +3,9 @@ import assert from "node:assert/strict";
 import type Anthropic from "@anthropic-ai/sdk";
 
 import { runAgent, type AnthropicLike } from "../agent/loop.js";
+import { buildDefaultRegistry } from "../agent/registry.js";
+import { transcribeAudio } from "../agent/tools/transcribe_audio.js";
+import { detectSilence } from "../agent/tools/detect_silence.js";
 import { createSession } from "../project/session.js";
 import { createProject } from "../project/io.js";
 import { addSource } from "../project/mutations.js";
@@ -78,6 +81,31 @@ function noConfirm() {
   return async () => {
     throw new Error("confirm should not be called");
   };
+}
+
+/**
+ * The default registry with the audio tools' execute swapped for canned
+ * results — `register` overwrites by name. Nothing else is stubbed, so a turn
+ * here exercises the real loop, the real dispatch, and the real schemas.
+ */
+function registryWithMockedAudio(canned: { transcript?: unknown; silences?: unknown }) {
+  const called: string[] = [];
+  const registry = buildDefaultRegistry();
+  registry.register({
+    schema: transcribeAudio.schema,
+    execute: async (_state, input) => {
+      called.push(`transcribe_audio:${JSON.stringify(input)}`);
+      return { ok: true, result: canned.transcript ?? { segments: [] } };
+    },
+  });
+  registry.register({
+    schema: detectSilence.schema,
+    execute: async (_state, input) => {
+      called.push(`detect_silence:${JSON.stringify(input)}`);
+      return { ok: true, result: canned.silences ?? { silences: [] } };
+    },
+  });
+  return { registry, called };
 }
 
 // ── Single tool call → text reply ─────────────────────────────────────────────
@@ -300,5 +328,194 @@ describe("runAgent — extended-thinking tolerance", () => {
     assert.ok(assistantTurn);
     const content = assistantTurn.content as Array<{ type: string }>;
     assert.ok(content.some((b) => b.type === "thinking"));
+  });
+});
+
+// ── Audio tools (3E-2) ────────────────────────────────────────────────────────
+//
+// The architectural guard for the slice: these turns dispatch audio tools with
+// ZERO changes to loop.ts. If they ever need one, the registry abstraction is
+// leaking and the registry is what should be fixed.
+
+describe("runAgent — audio tools", () => {
+  test("the default registry offers both audio tools to the model", () => {
+    const names = buildDefaultRegistry().allSchemas().map((s) => s.name);
+    assert.ok(names.includes("transcribe_audio"));
+    assert.ok(names.includes("detect_silence"));
+    // Still terminal, still present alongside them.
+    assert.ok(names.includes("propose_edit_plan"));
+  });
+
+  test("transcribe_audio dispatches through the registry — no loop change", async () => {
+    const { session } = makeSession();
+    const { registry, called } = registryWithMockedAudio({
+      transcript: {
+        sourceId: "s1",
+        segments: [{ start: 7, end: 11, text: "The price is forty nine dollars a month." }],
+        totalSegments: 5,
+        transcriptDuration: 20,
+        truncated: false,
+        hasAudio: true,
+        cached: false,
+      },
+    });
+
+    const client = mockClient([
+      toolUse("transcribe_audio", { sourceId: "s1", query: "price" }, "tu_ta"),
+      endTurn("You mention the price at 0:07."),
+    ]);
+
+    const r = await runAgent({
+      userPrompt: "where do I mention the price?",
+      session,
+      messages: [],
+      autoApprove: false,
+      confirm: noConfirm(),
+      client,
+      registry,
+    });
+
+    assert.equal(r.isError, false);
+    assert.deepEqual(called, ['transcribe_audio:{"sourceId":"s1","query":"price"}']);
+    assert.match(r.output, /0:07/);
+  });
+
+  test("detect_silence dispatches through the registry — no loop change", async () => {
+    const { session } = makeSession();
+    const { registry, called } = registryWithMockedAudio({
+      silences: { sourceId: "s1", silences: [{ start: 0, end: 3, duration: 3 }], hasAudio: true, cached: false },
+    });
+
+    const client = mockClient([
+      toolUse("detect_silence", { sourceId: "s1" }, "tu_ds"),
+      endTurn("There's a 3 second pause at the start."),
+    ]);
+
+    const r = await runAgent({
+      userPrompt: "is there dead air at the start?",
+      session,
+      messages: [],
+      autoApprove: false,
+      confirm: noConfirm(),
+      client,
+      registry,
+    });
+
+    assert.equal(r.isError, false);
+    assert.deepEqual(called, ['detect_silence:{"sourceId":"s1"}']);
+  });
+
+  test("silence-driven plan: detect_silence then trim at the silence boundary", async () => {
+    const { session, clipId } = makeSession();
+    const { registry, called } = registryWithMockedAudio({
+      silences: {
+        sourceId: "s1",
+        silences: [{ start: 0, end: 3, duration: 3 }],
+        minDuration: 0.5,
+        thresholdDb: -35,
+        hasAudio: true,
+        cached: false,
+      },
+    });
+
+    const client = mockClient([
+      toolUse("detect_silence", { sourceId: "s1" }, "tu_ds"),
+      // The cut lands on the silence boundary (3), not a guess.
+      toolUse("propose_edit_plan", {
+        summary: "Trim the 3s of dead air at the start.",
+        operations: [{ type: "trim", clipId, inPoint: 3, outPoint: 120 }],
+      }, "tu_plan"),
+      endTurn("Done."),
+    ]);
+
+    const r = await runAgent({
+      userPrompt: "cut the long pause before I start talking",
+      session,
+      messages: [],
+      autoApprove: true,
+      confirm: noConfirm(),
+      client,
+      registry,
+    });
+
+    assert.equal(r.isError, false);
+    assert.equal(called.length, 1, "detect_silence ran once");
+
+    // The trim landed on the boundary the tool reported.
+    const updated = clipsInOrder(r.session.state.timeline)[0]!;
+    assert.equal(updated.inPoint, 3);
+
+    // One undo entry for the whole turn, labeled with the user's own words.
+    assert.equal(r.session.undo.length, 1);
+    assert.equal(r.session.undo[0]!.label, "cut the long pause before I start talking");
+  });
+
+  test("a transcript-driven cut applies at a segment boundary", async () => {
+    const { session, clipId } = makeSession();
+    const { registry } = registryWithMockedAudio({
+      transcript: {
+        sourceId: "s1",
+        segments: [{ start: 7, end: 11, text: "The price is forty nine dollars a month." }],
+        totalSegments: 5,
+        transcriptDuration: 20,
+        truncated: false,
+        hasAudio: true,
+        cached: false,
+      },
+    });
+
+    const client = mockClient([
+      toolUse("transcribe_audio", { sourceId: "s1", query: "price" }, "tu_ta"),
+      toolUse("propose_edit_plan", {
+        summary: "Trim to where the price is mentioned.",
+        operations: [{ type: "trim", clipId, inPoint: 7, outPoint: 120 }],
+      }, "tu_plan"),
+      endTurn("Trimmed to the pricing mention."),
+    ]);
+
+    const r = await runAgent({
+      userPrompt: "trim to where I mention the price",
+      session,
+      messages: [],
+      autoApprove: true,
+      confirm: noConfirm(),
+      client,
+      registry,
+    });
+
+    assert.equal(r.isError, false);
+    // 7 is the segment start the tool reported — not mid-word.
+    assert.equal(clipsInOrder(r.session.state.timeline)[0]!.inPoint, 7);
+    assert.equal(r.session.undo.length, 1);
+  });
+
+  test("a no-audio tool_result is a normal turn, not an error", async () => {
+    const { session } = makeSession();
+    const { registry } = registryWithMockedAudio({
+      transcript: {
+        sourceId: "s1", segments: [], totalSegments: 0, transcriptDuration: 0,
+        truncated: false, hasAudio: false, cached: false,
+        note: "a.mp4 has no audio track — there is nothing to transcribe.",
+      },
+    });
+
+    const client = mockClient([
+      toolUse("transcribe_audio", { sourceId: "s1", query: "price" }, "tu_ta"),
+      endTurn("That clip has no audio track, so I can't find spoken content in it."),
+    ]);
+
+    const r = await runAgent({
+      userPrompt: "trim to where I mention the price",
+      session,
+      messages: [],
+      autoApprove: false,
+      confirm: noConfirm(),
+      client,
+      registry,
+    });
+
+    assert.equal(r.isError, false, "no audio is a normal answer, not a failure");
+    assert.match(r.output, /no audio track/);
+    assert.equal(r.session.undo.length, 0, "nothing was applied");
   });
 });

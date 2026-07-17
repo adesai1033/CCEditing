@@ -37,6 +37,36 @@ export interface SourceAnalyses {
   };
   moments?: MomentCacheEntry[];
   segmentDescriptions?: SegmentDescriptionEntry[];
+  // Full transcript for the source. The cache holds everything; the
+  // transcribe_audio tool only ever returns a window/query slice of it, so a
+  // long transcript never lands in the agent's context wholesale.
+  transcript?: TranscriptCacheEntry;
+  // Keyed by (thresholdDb, minDuration) — a -35dB result must never satisfy a
+  // -50dB request, so entries accumulate rather than overwrite.
+  silences?: SilenceCacheEntry[];
+}
+
+export interface TranscriptSegment {
+  start: number;          // seconds
+  end: number;            // seconds
+  text: string;
+}
+
+export interface TranscriptCacheEntry {
+  segments: TranscriptSegment[];
+  duration: number;       // seconds of audio transcribed
+  model: string;
+  // False when the source has no audio track. Cached so a silent source is
+  // not re-sent to the backend on every request.
+  hasAudio: boolean;
+  transcribedAt: string;
+}
+
+export interface SilenceCacheEntry {
+  thresholdDb: number;
+  minDuration: number;
+  silences: Array<{ start: number; end: number; duration: number }>;
+  detectedAt: string;
 }
 
 export interface MomentCacheEntry {

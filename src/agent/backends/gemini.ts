@@ -4,6 +4,15 @@ export const DESCRIBE_MODEL = "gemini-3.5-flash";
 
 let cachedAi: GoogleGenAI | null = null;
 
+/**
+ * Shared lazily-built client. Exported so sibling backends (transcription)
+ * reuse this one key-handling path instead of duplicating the env read and
+ * the missing-key error message.
+ */
+export function geminiClient(): GoogleGenAI {
+  return ai();
+}
+
 function ai(): GoogleGenAI {
   if (cachedAi) return cachedAi;
   const apiKey = process.env["GEMINI_API_KEY"];
