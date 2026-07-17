@@ -2,7 +2,7 @@ import type { ProjectState, SourceFile, TranscriptSegment } from "../../project/
 import type { Tool, ToolSchema, ToolResult } from "../types.js";
 import {
   realBackend as defaultBackend,
-  TRANSCRIBE_MODEL,
+  WHISPER_MODEL,
   type TranscriptionBackend,
 } from "../backends/transcription.js";
 
@@ -215,7 +215,7 @@ function writeCache(
         segments: r.segments,
         duration: r.duration,
         hasAudio: r.hasAudio,
-        model: TRANSCRIBE_MODEL,
+        model: WHISPER_MODEL,
         transcribedAt: new Date().toISOString(),
       },
     },

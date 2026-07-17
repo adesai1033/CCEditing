@@ -16,6 +16,7 @@ import {
   transcribe,
   planChunks,
   stitchChunk,
+  tightenWithWords,
   CHUNK_SECONDS,
   type TranscriptionBackend,
   type TranscriptionDeps,
@@ -404,5 +405,92 @@ describe("transcription backend — chunking", () => {
 
   test("CHUNK_SECONDS is the documented default", () => {
     assert.equal(planChunks(CHUNK_SECONDS + 1).length, 2);
+  });
+});
+
+// ── Word-level tightening (Whisper) ───────────────────────────────────────────
+//
+// Whisper's segment timestamps are decoder-driven and drift; its word
+// timestamps are DTW-aligned. Tightening is what buys the accuracy that
+// motivated moving off an LLM for this in the first place.
+
+describe("transcription backend — word tightening", () => {
+  test("segment boundaries snap to the span of their words", () => {
+    const out = tightenWithWords(
+      [{ start: 0, end: 5, text: "Hello there" }],
+      [
+        { word: "Hello", start: 0.8, end: 1.2 },
+        { word: "there", start: 1.3, end: 1.9 },
+      ],
+    );
+    // The decoder said 0–5; the audio says 0.8–1.9.
+    assert.deepEqual(out, [{ start: 0.8, end: 1.9, text: "Hello there" }]);
+  });
+
+  test("words are assigned to the segment that contains them", () => {
+    const out = tightenWithWords(
+      [
+        { start: 0, end: 3, text: "first line" },
+        { start: 3, end: 6, text: "second line" },
+      ],
+      [
+        { word: "first", start: 0.5, end: 0.9 },
+        { word: "line", start: 1.0, end: 1.4 },
+        { word: "second", start: 3.6, end: 4.0 },
+        { word: "line", start: 4.1, end: 4.8 },
+      ],
+    );
+    assert.deepEqual(out, [
+      { start: 0.5, end: 1.4, text: "first line" },
+      { start: 3.6, end: 4.8, text: "second line" },
+    ]);
+  });
+
+  test("a segment whose words cannot be located is left intact, not dropped", () => {
+    // A loose boundary is a far better failure than a missing line.
+    const segs = [{ start: 10, end: 12, text: "orphaned" }];
+    assert.deepEqual(tightenWithWords(segs, [{ word: "elsewhere", start: 50, end: 51 }]), segs);
+  });
+
+  test("no words at all is a no-op", () => {
+    const segs = [{ start: 0, end: 5, text: "Hello" }];
+    assert.deepEqual(tightenWithWords(segs, []), segs);
+  });
+
+  test("tightening never widens a segment", () => {
+    const segs = [{ start: 1, end: 4, text: "inside" }];
+    const out = tightenWithWords(segs, [{ word: "inside", start: 1.5, end: 3.5 }]);
+    assert.ok(out[0]!.start >= segs[0]!.start);
+    assert.ok(out[0]!.end <= segs[0]!.end);
+  });
+
+  test("tightened segments survive chunk stitching with the offset applied", async () => {
+    // The two mechanisms compose: word-accurate boundaries, then offset onto
+    // the source timeline.
+    const deps: TranscriptionDeps = {
+      hasAudioTrack: async () => true,
+      extractAudio: async () => {},
+      transcribeChunk: async () => [{ start: 0.8, end: 1.9, text: "tightened" }],
+    };
+    const r = await transcribe("/fake/x.mp4", 1200, deps);
+    assert.deepEqual(r.segments.map((s) => [s.start, s.end]), [[0.8, 1.9], [600.8, 601.9]]);
+  });
+});
+
+describe("transcription backend — timestamp hygiene", () => {
+  test("float32 noise from the API is rounded to milliseconds", () => {
+    // Whisper really returns values like 1.0800000429153442; storing that
+    // verbatim would litter the project file.
+    const out = stitchChunk({ index: 0, start: 0, duration: 600 }, [
+      { start: 0, end: 1.0800000429153442, text: "Dracarys!" },
+    ]);
+    assert.deepEqual(out, [{ start: 0, end: 1.08, text: "Dracarys!" }]);
+  });
+
+  test("rounding survives the chunk offset", () => {
+    const out = stitchChunk({ index: 1, start: 600, duration: 600 }, [
+      { start: 0.0000001, end: 1.0800000429153442, text: "x" },
+    ]);
+    assert.deepEqual(out, [{ start: 600, end: 601.08, text: "x" }]);
   });
 });

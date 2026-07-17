@@ -15,10 +15,12 @@ import "../utils/env.js"; // must stay first — populates process.env from .env
 import Anthropic from "@anthropic-ai/sdk";
 import { GoogleGenAI } from "@google/genai";
 import { TwelveLabs } from "twelvelabs-js";
+import OpenAI from "openai";
 
 import { MODEL_DEFAULT } from "../agent/loop.js";
 import { DESCRIBE_MODEL } from "../agent/backends/gemini.js";
 import { MODEL_NAME as TL_MODEL } from "../agent/backends/twelvelabs.js";
+import { WHISPER_MODEL } from "../agent/backends/transcription.js";
 
 const pad = (s: string) => s.padEnd(18);
 const brief = (e: unknown) => String((e as Error).message).replace(/\s+/g, " ").slice(0, 140);
@@ -64,6 +66,19 @@ async function checkTwelveLabs(): Promise<string> {
   }
 }
 
-const results = await Promise.all([checkAnthropic(), checkGemini(), checkTwelveLabs()]);
+async function checkOpenAI(): Promise<string> {
+  const key = process.env["OPENAI_API_KEY"];
+  if (!key) return `${pad("OPENAI_API_KEY")} not set`;
+  try {
+    // Retrieving the model is enough to prove auth + reachability, without
+    // paying for a transcription on every check.
+    const m = await new OpenAI({ apiKey: key }).models.retrieve(WHISPER_MODEL);
+    return `${pad("OPENAI_API_KEY")} OK   (${m.id})`;
+  } catch (e) {
+    return `${pad("OPENAI_API_KEY")} FAIL (${WHISPER_MODEL}) — ${brief(e)}`;
+  }
+}
+
+const results = await Promise.all([checkAnthropic(), checkGemini(), checkTwelveLabs(), checkOpenAI()]);
 for (const line of results) console.log(line);
 if (results.some((r) => r.includes("FAIL"))) process.exit(1);
