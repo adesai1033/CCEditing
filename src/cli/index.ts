@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import "../utils/env.js"; // must stay first — populates process.env from .env
 import { Command } from "commander";
 import chalk from "chalk";
 import path from "node:path";

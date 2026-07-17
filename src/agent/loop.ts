@@ -10,7 +10,7 @@ import {
   type PlanForConfirmation,
 } from "./propose_edit_plan.js";
 
-const MODEL_DEFAULT = "claude-sonnet-4-6";
+export const MODEL_DEFAULT = "claude-sonnet-4-6";
 const MAX_TOOL_CALLS_PER_TURN = 25;
 const MAX_TOKENS = 4096;
 

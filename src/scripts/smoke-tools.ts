@@ -8,6 +8,7 @@
  * Tools print their result and the populated cache field. Each tool is
  * exercised twice to verify the cache hit path.
  */
+import "../utils/env.js"; // must stay first — populates process.env from .env
 import path from "node:path";
 import { existsSync } from "node:fs";
 import { probeFile } from "../media/probe.js";

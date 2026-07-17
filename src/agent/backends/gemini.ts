@@ -1,6 +1,6 @@
 import { GoogleGenAI } from "@google/genai";
 
-export const DESCRIBE_MODEL = "gemini-2.5-flash";
+export const DESCRIBE_MODEL = "gemini-3.5-flash";
 
 let cachedAi: GoogleGenAI | null = null;
 

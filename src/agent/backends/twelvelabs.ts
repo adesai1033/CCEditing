@@ -2,7 +2,7 @@ import { createReadStream } from "node:fs";
 import { TwelveLabs } from "twelvelabs-js";
 
 const INDEX_NAME_DEFAULT = "cutcli";
-const MODEL_NAME = "marengo2.7";
+export const MODEL_NAME = "marengo3.0";
 
 let cachedClient: TwelveLabs | null = null;
 let cachedIndexId: string | null = null;
