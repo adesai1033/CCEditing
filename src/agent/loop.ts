@@ -1,8 +1,14 @@
-import Anthropic from "@anthropic-ai/sdk";
 import type { ProjectSession } from "../project/session.js";
 import { applyPlan } from "../project/session.js";
 import { buildSystemPrompt } from "./prompt.js";
 import { buildDefaultRegistry, type ToolRegistry } from "./registry.js";
+import { AnthropicProvider } from "./providers/anthropic.js";
+import type {
+  ChatProvider,
+  ChatResponse,
+  ContentBlock,
+  NeutralMessage,
+} from "./providers/types.js";
 import {
   AgentOperationSchema,
   ProposeEditPlanInputSchema,
@@ -10,9 +16,12 @@ import {
   type PlanForConfirmation,
 } from "./propose_edit_plan.js";
 
-export const MODEL_DEFAULT = "claude-sonnet-4-6";
 const MAX_TOOL_CALLS_PER_TURN = 25;
 const MAX_TOKENS = 4096;
+
+// Neutral block aliases — the loop works exclusively in these.
+type ToolUseBlock = Extract<ContentBlock, { type: "tool_use" }>;
+type ToolResultBlock = Extract<ContentBlock, { type: "tool_result" }>;
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
@@ -24,27 +33,19 @@ export type ProgressEvent =
 export interface AgentInput {
   userPrompt: string;
   session: ProjectSession;
-  messages: Anthropic.Messages.MessageParam[];
+  messages: NeutralMessage[];
   autoApprove: boolean;
   confirm: (plan: PlanForConfirmation) => Promise<{ approved: boolean }>;
   onProgress?: (event: ProgressEvent) => void;
-  // Injected for tests. Defaults to a real Anthropic client built from
+  // Injected for tests. Defaults to a real AnthropicProvider built from
   // ANTHROPIC_API_KEY. Production callers omit this.
-  client?: AnthropicLike;
+  provider?: ChatProvider;
   // Injected for tests. Defaults to buildDefaultRegistry().
   registry?: ToolRegistry;
 }
 
-// Minimal surface of the Anthropic SDK we use, so tests can mock without
-// pulling in the full client. The real client implements this trivially.
-export interface AnthropicLike {
-  messages: {
-    create(params: Anthropic.Messages.MessageCreateParamsNonStreaming): Promise<Anthropic.Messages.Message>;
-  };
-}
-
 export interface AgentResult {
-  messages: Anthropic.Messages.MessageParam[];
+  messages: NeutralMessage[];
   session: ProjectSession;
   output: string;
   isError: boolean;
@@ -55,7 +56,7 @@ export interface AgentResult {
 // Explicit, threaded through the loop — never smeared across closures.
 // Mirrors what a future LangGraph State channel would carry.
 interface AgentState {
-  messages: Anthropic.Messages.MessageParam[];
+  messages: NeutralMessage[];
   session: ProjectSession;
   autoApprove: boolean;
   toolBudget: number;
@@ -68,13 +69,13 @@ interface AgentState {
 // ── Entrypoint ────────────────────────────────────────────────────────────────
 
 export async function runAgent(input: AgentInput): Promise<AgentResult> {
-  const client = input.client ?? buildRealClient();
+  const provider = input.provider ?? buildDefaultProvider();
   const registry = input.registry ?? buildDefaultRegistry();
 
   let state: AgentState = {
     messages: [
       ...input.messages,
-      { role: "user", content: input.userPrompt },
+      { role: "user", content: [{ type: "text", text: input.userPrompt }] },
     ],
     session: input.session,
     autoApprove: input.autoApprove,
@@ -86,25 +87,26 @@ export async function runAgent(input: AgentInput): Promise<AgentResult> {
   };
 
   const system = await buildSystemPrompt(state.session.state);
-  const tools = registry.allSchemas().map(toAnthropicTool);
+  const tools = registry.allSchemas();
 
   for (let i = 0; i < MAX_TOOL_CALLS_PER_TURN + 1; i++) {
-    let response: Anthropic.Messages.Message;
+    let response: ChatResponse;
     try {
-      response = await client.messages.create({
-        model: MODEL_DEFAULT,
+      response = await provider.send({
         system,
         messages: state.messages,
         tools,
-        max_tokens: MAX_TOKENS,
+        maxTokens: MAX_TOKENS,
+        // No reasoning config this slice — extended thinking is off (3E-2.5).
       });
     } catch (err: unknown) {
       return finalize(state, `Agent error: ${(err as Error).message}`, true);
     }
 
-    // Append the assistant's response verbatim. Content may include
-    // text, tool_use, and (when extended thinking is enabled later) thinking
-    // blocks — we preserve all of them so the SDK round-trip stays valid.
+    // Append the assistant's response verbatim. Content may include text,
+    // tool_use, and (when extended thinking is enabled in 3E-2.5) reasoning
+    // blocks — we preserve ALL of them unchanged so the provider round-trip
+    // stays valid. Do not filter (3E-1 decision 11, now on neutral blocks).
     state = {
       ...state,
       messages: [
@@ -113,7 +115,8 @@ export async function runAgent(input: AgentInput): Promise<AgentResult> {
       ],
     };
 
-    // Surface any text blocks via progress and remember them for the final summary.
+    // Surface any text blocks via progress and remember them for the final
+    // summary. Reasoning blocks are carried in history but not surfaced as text.
     for (const block of response.content) {
       if (block.type === "text") {
         state.assistantText.push(block.text);
@@ -121,34 +124,36 @@ export async function runAgent(input: AgentInput): Promise<AgentResult> {
       }
     }
 
-    if (response.stop_reason === "end_turn" || response.stop_reason === "max_tokens") {
+    if (response.stopReason === "end_turn" || response.stopReason === "max_output") {
+      // `max_output` is treated as a plain end this slice (pre-slice behavior);
+      // 3E-2.5 tightens it.
       return finalize(state, null, false);
     }
 
-    if (response.stop_reason !== "tool_use") {
-      // Unexpected stop_reason — bail with the text we have.
+    if (response.stopReason !== "tool_use") {
+      // Unexpected stop reason — bail with the text we have.
       return finalize(state, null, false);
     }
 
     const toolUses = response.content.filter(
-      (b): b is Anthropic.Messages.ToolUseBlock => b.type === "tool_use",
+      (b): b is ToolUseBlock => b.type === "tool_use",
     );
 
     if (toolUses.length === 0) {
-      // Defensive: stop_reason said tool_use but no tool_use blocks appeared.
+      // Defensive: stopReason said tool_use but no tool_use blocks appeared.
       return finalize(state, null, false);
     }
 
-    const toolResults: Anthropic.Messages.ToolResultBlockParam[] = [];
+    const toolResults: ToolResultBlock[] = [];
     let stopAfterThisRound = false;
 
     for (const tu of toolUses) {
       if (state.toolBudget <= 0) {
         toolResults.push({
           type: "tool_result",
-          tool_use_id: tu.id,
+          toolUseId: tu.id,
           content: "Tool budget exhausted for this turn — agent must stop.",
-          is_error: true,
+          isError: true,
         });
         stopAfterThisRound = true;
         continue;
@@ -181,12 +186,12 @@ export async function runAgent(input: AgentInput): Promise<AgentResult> {
 
 interface ToolHandled {
   state: AgentState;
-  result: Anthropic.Messages.ToolResultBlockParam;
+  result: ToolResultBlock;
   stopAfterThisRound: boolean;
 }
 
 async function dispatchToolUse(
-  tu: Anthropic.Messages.ToolUseBlock,
+  tu: ToolUseBlock,
   state: AgentState,
   registry: ToolRegistry,
   input: AgentInput,
@@ -204,7 +209,7 @@ async function dispatchToolUse(
     input.onProgress?.({ type: "tool_result", name: tu.name, ok: false, durationMs: Date.now() - start });
     return {
       state,
-      result: { type: "tool_result", tool_use_id: tu.id, content: errText, is_error: true },
+      result: { type: "tool_result", toolUseId: tu.id, content: errText, isError: true },
       stopAfterThisRound: false,
     };
   }
@@ -218,9 +223,9 @@ async function dispatchToolUse(
       state,
       result: {
         type: "tool_result",
-        tool_use_id: tu.id,
+        toolUseId: tu.id,
         content: `Tool threw: ${(err as Error).message}`,
-        is_error: true,
+        isError: true,
       },
       stopAfterThisRound: false,
     };
@@ -230,7 +235,7 @@ async function dispatchToolUse(
     input.onProgress?.({ type: "tool_result", name: tu.name, ok: false, durationMs: Date.now() - start });
     return {
       state,
-      result: { type: "tool_result", tool_use_id: tu.id, content: outcome.error, is_error: true },
+      result: { type: "tool_result", toolUseId: tu.id, content: outcome.error, isError: true },
       stopAfterThisRound: false,
     };
   }
@@ -249,7 +254,7 @@ async function dispatchToolUse(
     state: { ...state, session: nextSession },
     result: {
       type: "tool_result",
-      tool_use_id: tu.id,
+      toolUseId: tu.id,
       content: JSON.stringify(outcome.result),
     },
     stopAfterThisRound: false,
@@ -259,7 +264,7 @@ async function dispatchToolUse(
 // ── propose_edit_plan special case ────────────────────────────────────────────
 
 async function handleProposePlan(
-  tu: Anthropic.Messages.ToolUseBlock,
+  tu: ToolUseBlock,
   state: AgentState,
   input: AgentInput,
   startMs: number,
@@ -271,9 +276,9 @@ async function handleProposePlan(
       state,
       result: {
         type: "tool_result",
-        tool_use_id: tu.id,
+        toolUseId: tu.id,
         content: `Plan input failed validation: ${parsed.error.message}`,
-        is_error: true,
+        isError: true,
       },
       stopAfterThisRound: false,
     };
@@ -289,9 +294,9 @@ async function handleProposePlan(
         state,
         result: {
           type: "tool_result",
-          tool_use_id: tu.id,
+          toolUseId: tu.id,
           content: `Operation failed validation: ${r.error.message}`,
-          is_error: true,
+          isError: true,
         },
         stopAfterThisRound: false,
       };
@@ -313,7 +318,7 @@ async function handleProposePlan(
       state: { ...state, rejected: true },
       result: {
         type: "tool_result",
-        tool_use_id: tu.id,
+        toolUseId: tu.id,
         content: JSON.stringify({ status: "rejected", message: "User rejected the plan." }),
       },
       stopAfterThisRound: false,
@@ -333,13 +338,13 @@ async function handleProposePlan(
       },
       result: {
         type: "tool_result",
-        tool_use_id: tu.id,
+        toolUseId: tu.id,
         content: JSON.stringify({
           status: "failed",
           failedAt: applyResult.failedAt,
           error: applyResult.error,
         }),
-        is_error: true,
+        isError: true,
       },
       stopAfterThisRound: false,
     };
@@ -354,7 +359,7 @@ async function handleProposePlan(
     },
     result: {
       type: "tool_result",
-      tool_use_id: tu.id,
+      toolUseId: tu.id,
       content: JSON.stringify({
         status: "applied",
         summary: plan.summary,
@@ -386,33 +391,25 @@ function finalize(state: AgentState, errorOverride: string | null, hadError: boo
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-function toAnthropicTool(s: { name: string; description: string; input_schema: object }): Anthropic.Messages.Tool {
-  return {
-    name: s.name,
-    description: s.description,
-    input_schema: s.input_schema as Anthropic.Messages.Tool["input_schema"],
-  };
-}
-
-function lastUserPromptFrom(messages: Anthropic.Messages.MessageParam[]): string {
-  // Walk backwards to find the most recent role=user message whose content
-  // is a plain string (i.e. user prompt, not a tool_result envelope).
+function lastUserPromptFrom(messages: NeutralMessage[]): string {
+  // Walk backwards to find the most recent role=user message that is a genuine
+  // prompt (a text block) rather than a tool_result envelope. The current
+  // turn's prompt is appended last among user text messages, so it wins.
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]!;
-    if (m.role === "user" && typeof m.content === "string") return m.content;
+    if (m.role !== "user") continue;
+    if (m.content.some((b) => b.type === "tool_result")) continue;
+    const text = m.content.find((b): b is Extract<ContentBlock, { type: "text" }> => b.type === "text");
+    if (text) return text.text;
   }
   return "(unknown prompt)";
 }
 
-let cachedClient: Anthropic | null = null;
-function buildRealClient(): AnthropicLike {
-  if (cachedClient) return cachedClient;
-  const apiKey = process.env["ANTHROPIC_API_KEY"];
-  if (!apiKey) {
-    throw new Error(
-      "ANTHROPIC_API_KEY is not set. Export it before running an agent turn (get one at https://console.anthropic.com).",
-    );
-  }
-  cachedClient = new Anthropic({ apiKey });
-  return cachedClient;
+let cachedProvider: ChatProvider | null = null;
+function buildDefaultProvider(): ChatProvider {
+  // Lazy + cached, mirroring the pre-slice real-client construction: the
+  // fail-fast missing-key error surfaces on first agent turn, not at startup.
+  if (cachedProvider) return cachedProvider;
+  cachedProvider = new AnthropicProvider();
+  return cachedProvider;
 }

@@ -1,8 +1,8 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import type Anthropic from "@anthropic-ai/sdk";
 
-import { runAgent, type AnthropicLike } from "../agent/loop.js";
+import { runAgent } from "../agent/loop.js";
+import type { ChatProvider, ChatResponse, ContentBlock } from "../agent/providers/types.js";
 import { buildDefaultRegistry } from "../agent/registry.js";
 import { transcribeAudio } from "../agent/tools/transcribe_audio.js";
 import { detectSilence } from "../agent/tools/detect_silence.js";
@@ -37,44 +37,33 @@ function makeSession() {
   return { session: createSession(state), clipId: state.timeline.headId! };
 }
 
-// A tiny mock Anthropic client that returns canned responses, one per call.
-function mockClient(responses: Anthropic.Messages.Message[]): AnthropicLike {
+// A tiny mock ChatProvider that returns canned NEUTRAL responses, one per call.
+// This is the seam the loop now talks to — no Anthropic SDK shapes here.
+function mockProvider(responses: ChatResponse[]): ChatProvider {
   let i = 0;
   return {
-    messages: {
-      create: async () => {
-        const r = responses[i++];
-        if (!r) throw new Error(`mockClient exhausted at call ${i}`);
-        return r;
-      },
+    send: async () => {
+      const r = responses[i++];
+      if (!r) throw new Error(`mockProvider exhausted at call ${i}`);
+      return r;
     },
   };
 }
 
-function endTurn(text: string): Anthropic.Messages.Message {
+function endTurn(text: string): ChatResponse {
   return {
-    id: "msg_test",
-    type: "message",
-    role: "assistant",
-    model: "claude-sonnet-4-6",
-    content: [{ type: "text", text, citations: null }],
-    stop_reason: "end_turn",
-    stop_sequence: null,
-    usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, server_tool_use: null, service_tier: null },
-  } as unknown as Anthropic.Messages.Message;
+    content: [{ type: "text", text }],
+    stopReason: "end_turn",
+    usage: { inputTokens: 0, outputTokens: 0 },
+  };
 }
 
-function toolUse(name: string, input: unknown, id = "tu_1"): Anthropic.Messages.Message {
+function toolUse(name: string, input: unknown, id = "tu_1"): ChatResponse {
   return {
-    id: "msg_tu",
-    type: "message",
-    role: "assistant",
-    model: "claude-sonnet-4-6",
     content: [{ type: "tool_use", id, name, input }],
-    stop_reason: "tool_use",
-    stop_sequence: null,
-    usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, server_tool_use: null, service_tier: null },
-  } as unknown as Anthropic.Messages.Message;
+    stopReason: "tool_use",
+    usage: { inputTokens: 0, outputTokens: 0 },
+  };
 }
 
 function noConfirm() {
@@ -113,7 +102,7 @@ function registryWithMockedAudio(canned: { transcript?: unknown; silences?: unkn
 describe("runAgent — basic flow", () => {
   test("calls query_timeline then ends turn with text", async () => {
     const { session } = makeSession();
-    const client = mockClient([
+    const provider = mockProvider([
       toolUse("query_timeline", {}, "tu_qt"),
       endTurn("There is one clip on the timeline."),
     ]);
@@ -126,7 +115,7 @@ describe("runAgent — basic flow", () => {
       autoApprove: false,
       confirm: noConfirm(),
       onProgress: (e) => events.push(e.type),
-      client,
+      provider,
     });
 
     assert.equal(r.isError, false);
@@ -138,18 +127,18 @@ describe("runAgent — basic flow", () => {
 
   test("multi-turn: second runAgent call sees prior messages", async () => {
     const { session } = makeSession();
-    const client = mockClient([endTurn("OK.")]);
+    const provider = mockProvider([endTurn("OK.")]);
 
     const r = await runAgent({
       userPrompt: "second prompt",
       session,
       messages: [
-        { role: "user", content: "first prompt" },
-        { role: "assistant", content: [{ type: "text", text: "first reply" }] as unknown as string },
+        { role: "user", content: [{ type: "text", text: "first prompt" }] },
+        { role: "assistant", content: [{ type: "text", text: "first reply" }] },
       ],
       autoApprove: false,
       confirm: noConfirm(),
-      client,
+      provider,
     });
 
     assert.equal(r.isError, false);
@@ -164,7 +153,7 @@ describe("runAgent — basic flow", () => {
 describe("runAgent — propose_edit_plan", () => {
   test("auto-approve: applies plan without calling confirm; undo entry has the user prompt as label", async () => {
     const { session, clipId } = makeSession();
-    const client = mockClient([
+    const provider = mockProvider([
       toolUse("propose_edit_plan", {
         summary: "Trim the start.",
         operations: [{ type: "trim", clipId, inPoint: 0, outPoint: 30 }],
@@ -179,7 +168,7 @@ describe("runAgent — propose_edit_plan", () => {
       messages: [],
       autoApprove: true,
       confirm: async () => { confirmCalled = true; return { approved: true }; },
-      client,
+      provider,
     });
 
     assert.equal(r.isError, false);
@@ -195,7 +184,7 @@ describe("runAgent — propose_edit_plan", () => {
 
   test("user rejects: no state change, agent gets rejected tool_result", async () => {
     const { session, clipId } = makeSession();
-    const client = mockClient([
+    const provider = mockProvider([
       toolUse("propose_edit_plan", {
         summary: "Trim the start.",
         operations: [{ type: "trim", clipId, inPoint: 0, outPoint: 30 }],
@@ -209,7 +198,7 @@ describe("runAgent — propose_edit_plan", () => {
       messages: [],
       autoApprove: false,
       confirm: async () => ({ approved: false }),
-      client,
+      provider,
     });
 
     assert.equal(r.isError, false);
@@ -221,7 +210,7 @@ describe("runAgent — propose_edit_plan", () => {
 
   test("applyPlan fails: tool_result has is_error, agent continues and ends", async () => {
     const { session, clipId } = makeSession();
-    const client = mockClient([
+    const provider = mockProvider([
       toolUse("propose_edit_plan", {
         summary: "Bad trim.",
         operations: [{ type: "trim", clipId, inPoint: 50, outPoint: 30 }], // invalid
@@ -235,7 +224,7 @@ describe("runAgent — propose_edit_plan", () => {
       messages: [],
       autoApprove: true,
       confirm: noConfirm(),
-      client,
+      provider,
     });
 
     assert.equal(r.isError, true);
@@ -252,7 +241,7 @@ describe("runAgent — propose_edit_plan", () => {
 describe("runAgent — error paths", () => {
   test("unknown tool: tool_result is_error, agent gracefully continues", async () => {
     const { session } = makeSession();
-    const client = mockClient([
+    const provider = mockProvider([
       toolUse("does_not_exist", {}, "tu_bad"),
       endTurn("I'll stop."),
     ]);
@@ -263,19 +252,17 @@ describe("runAgent — error paths", () => {
       messages: [],
       autoApprove: false,
       confirm: noConfirm(),
-      client,
+      provider,
     });
 
     assert.equal(r.isError, false);
     assert.match(r.output, /I'll stop/);
   });
 
-  test("API error surfaces as friendly output", async () => {
+  test("provider error surfaces as friendly output", async () => {
     const { session } = makeSession();
-    const client: AnthropicLike = {
-      messages: {
-        create: async () => { throw new Error("rate limited"); },
-      },
+    const provider: ChatProvider = {
+      send: async () => { throw new Error("rate limited"); },
     };
 
     const r = await runAgent({
@@ -284,7 +271,7 @@ describe("runAgent — error paths", () => {
       messages: [],
       autoApprove: false,
       confirm: noConfirm(),
-      client,
+      provider,
     });
 
     assert.equal(r.isError, true);
@@ -292,26 +279,24 @@ describe("runAgent — error paths", () => {
   });
 });
 
-// ── Thinking-block tolerance ──────────────────────────────────────────────────
+// ── Reasoning-block round-trip through the loop (guards 3E-2.5) ────────────────
 
-describe("runAgent — extended-thinking tolerance", () => {
-  test("assistant turn with a thinking block alongside tool_use is handled without error", async () => {
+describe("runAgent — reasoning-block tolerance", () => {
+  test("a neutral reasoning block alongside tool_use survives history unchanged", async () => {
     const { session } = makeSession();
-    // Canned response with a `thinking` block + `tool_use` block (decision 11).
-    const withThinking = {
-      id: "msg_think",
-      type: "message",
-      role: "assistant",
-      model: "claude-sonnet-4-6",
+    // Canned response with an opaque reasoning block + a tool_use block. The
+    // opaque payload stands in for a provider's stateful reasoning; the loop
+    // must carry it through history verbatim without inspecting it.
+    const opaque = { type: "thinking", thinking: "Let me see the timeline first.", signature: "sig" };
+    const withReasoning: ChatResponse = {
       content: [
-        { type: "thinking", thinking: "Let me see the timeline first.", signature: "sig" },
+        { type: "reasoning", provider: "anthropic", opaque, text: "Let me see the timeline first." },
         { type: "tool_use", id: "tu_qt2", name: "query_timeline", input: {} },
       ],
-      stop_reason: "tool_use",
-      stop_sequence: null,
-      usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, server_tool_use: null, service_tier: null },
-    } as unknown as Anthropic.Messages.Message;
-    const client = mockClient([withThinking, endTurn("One clip.")]);
+      stopReason: "tool_use",
+      usage: { inputTokens: 0, outputTokens: 0, reasoningTokens: 12 },
+    };
+    const provider = mockProvider([withReasoning, endTurn("One clip.")]);
 
     const r = await runAgent({
       userPrompt: "describe the timeline",
@@ -319,15 +304,20 @@ describe("runAgent — extended-thinking tolerance", () => {
       messages: [],
       autoApprove: false,
       confirm: noConfirm(),
-      client,
+      provider,
     });
 
     assert.equal(r.isError, false);
-    // The thinking block is preserved in messages, not stripped
-    const assistantTurn = r.messages.find((m) => m.role === "assistant" && Array.isArray(m.content));
+    // The reasoning block is preserved in messages, opaque intact, not stripped.
+    const assistantTurn = r.messages.find(
+      (m) => m.role === "assistant" && m.content.some((b) => b.type === "reasoning"),
+    );
     assert.ok(assistantTurn);
-    const content = assistantTurn.content as Array<{ type: string }>;
-    assert.ok(content.some((b) => b.type === "thinking"));
+    const reasoning = assistantTurn.content.find(
+      (b): b is Extract<ContentBlock, { type: "reasoning" }> => b.type === "reasoning",
+    );
+    assert.ok(reasoning);
+    assert.deepEqual(reasoning.opaque, opaque);
   });
 });
 
@@ -360,7 +350,7 @@ describe("runAgent — audio tools", () => {
       },
     });
 
-    const client = mockClient([
+    const provider = mockProvider([
       toolUse("transcribe_audio", { sourceId: "s1", query: "price" }, "tu_ta"),
       endTurn("You mention the price at 0:07."),
     ]);
@@ -371,7 +361,7 @@ describe("runAgent — audio tools", () => {
       messages: [],
       autoApprove: false,
       confirm: noConfirm(),
-      client,
+      provider,
       registry,
     });
 
@@ -386,7 +376,7 @@ describe("runAgent — audio tools", () => {
       silences: { sourceId: "s1", silences: [{ start: 0, end: 3, duration: 3 }], hasAudio: true, cached: false },
     });
 
-    const client = mockClient([
+    const provider = mockProvider([
       toolUse("detect_silence", { sourceId: "s1" }, "tu_ds"),
       endTurn("There's a 3 second pause at the start."),
     ]);
@@ -397,7 +387,7 @@ describe("runAgent — audio tools", () => {
       messages: [],
       autoApprove: false,
       confirm: noConfirm(),
-      client,
+      provider,
       registry,
     });
 
@@ -418,7 +408,7 @@ describe("runAgent — audio tools", () => {
       },
     });
 
-    const client = mockClient([
+    const provider = mockProvider([
       toolUse("detect_silence", { sourceId: "s1" }, "tu_ds"),
       // The cut lands on the silence boundary (3), not a guess.
       toolUse("propose_edit_plan", {
@@ -434,7 +424,7 @@ describe("runAgent — audio tools", () => {
       messages: [],
       autoApprove: true,
       confirm: noConfirm(),
-      client,
+      provider,
       registry,
     });
 
@@ -464,7 +454,7 @@ describe("runAgent — audio tools", () => {
       },
     });
 
-    const client = mockClient([
+    const provider = mockProvider([
       toolUse("transcribe_audio", { sourceId: "s1", query: "price" }, "tu_ta"),
       toolUse("propose_edit_plan", {
         summary: "Trim to where the price is mentioned.",
@@ -479,7 +469,7 @@ describe("runAgent — audio tools", () => {
       messages: [],
       autoApprove: true,
       confirm: noConfirm(),
-      client,
+      provider,
       registry,
     });
 
@@ -499,7 +489,7 @@ describe("runAgent — audio tools", () => {
       },
     });
 
-    const client = mockClient([
+    const provider = mockProvider([
       toolUse("transcribe_audio", { sourceId: "s1", query: "price" }, "tu_ta"),
       endTurn("That clip has no audio track, so I can't find spoken content in it."),
     ]);
@@ -510,7 +500,7 @@ describe("runAgent — audio tools", () => {
       messages: [],
       autoApprove: false,
       confirm: noConfirm(),
-      client,
+      provider,
       registry,
     });
 

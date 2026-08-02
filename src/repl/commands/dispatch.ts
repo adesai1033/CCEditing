@@ -1,7 +1,7 @@
 import path from "node:path";
 import os from "node:os";
 import { mkdir, unlink } from "node:fs/promises";
-import type Anthropic from "@anthropic-ai/sdk";
+import type { NeutralMessage } from "../../agent/providers/types.js";
 import type { ViewportState } from "../../display/timeline.js";
 import { buildHelpText } from "./registry.js";
 import { probeFile } from "../../media/probe.js";
@@ -23,7 +23,7 @@ import type { PlanForConfirmation } from "../../agent/propose_edit_plan.js";
 
 export interface ReplState {
   session: ProjectSession | null;
-  messages: Anthropic.Messages.MessageParam[];
+  messages: NeutralMessage[];
   autoApprove: boolean;
 }
 
@@ -45,7 +45,7 @@ export interface DispatchOptions {
   onAgentProgress?: (event: ProgressEvent) => void;
   /** Injected for tests — defaults to runAgent. */
   agent?: (input: AgentInput) => Promise<{
-    messages: Anthropic.Messages.MessageParam[];
+    messages: NeutralMessage[];
     session: ProjectSession;
     output: string;
     isError: boolean;
@@ -105,7 +105,7 @@ function withSlashContinuity(result: DispatchResult, prevState: ReplState): Disp
       ...result.newState,
       messages: [
         ...result.newState.messages,
-        { role: "user", content: `(via slash command: ${note})` },
+        { role: "user", content: [{ type: "text", text: `(via slash command: ${note})` }] },
       ],
     },
   };

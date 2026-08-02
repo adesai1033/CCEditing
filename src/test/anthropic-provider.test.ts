@@ -1,0 +1,237 @@
+import { test, describe } from "node:test";
+import assert from "node:assert/strict";
+import type Anthropic from "@anthropic-ai/sdk";
+
+import { AnthropicProvider, MODEL_DEFAULT, type AnthropicClientLike } from "../agent/providers/anthropic.js";
+import type { ChatRequest, NeutralMessage } from "../agent/providers/types.js";
+import type { ToolSchema } from "../agent/types.js";
+
+// ── Capturing mock SDK client ─────────────────────────────────────────────────
+//
+// Records the params `send()` passes to messages.create and returns a canned
+// response. Lets us assert both directions of translation at the seam.
+
+function capturingClient(response: Anthropic.Messages.Message): {
+  client: AnthropicClientLike;
+  lastParams: () => Anthropic.Messages.MessageCreateParamsNonStreaming;
+} {
+  let captured: Anthropic.Messages.MessageCreateParamsNonStreaming | undefined;
+  return {
+    client: {
+      messages: {
+        create: async (params) => {
+          captured = params;
+          return response;
+        },
+      },
+    },
+    lastParams: () => {
+      if (!captured) throw new Error("create was never called");
+      return captured;
+    },
+  };
+}
+
+function anthropicMessage(
+  content: unknown[],
+  stopReason: Anthropic.Messages.Message["stop_reason"],
+  usage: Partial<Anthropic.Messages.Usage> = {},
+): Anthropic.Messages.Message {
+  return {
+    id: "msg_test",
+    type: "message",
+    role: "assistant",
+    model: MODEL_DEFAULT,
+    content,
+    stop_reason: stopReason,
+    stop_sequence: null,
+    usage: {
+      input_tokens: 0, output_tokens: 0,
+      cache_creation_input_tokens: 0, cache_read_input_tokens: 0,
+      server_tool_use: null, service_tier: null,
+      ...usage,
+    },
+  } as unknown as Anthropic.Messages.Message;
+}
+
+const TOOLS: ToolSchema[] = [
+  {
+    name: "query_timeline",
+    description: "Inspect the timeline.",
+    input_schema: { type: "object", properties: {}, required: [] },
+  },
+];
+
+function baseRequest(messages: NeutralMessage[]): ChatRequest {
+  return { system: "You are an editor.", messages, tools: TOOLS, maxTokens: 4096 };
+}
+
+// ── Neutral request → Anthropic params ────────────────────────────────────────
+
+describe("AnthropicProvider — request translation", () => {
+  test("maps model, system, max_tokens, tools, and message shape", async () => {
+    const { client, lastParams } = capturingClient(anthropicMessage([{ type: "text", text: "hi", citations: null }], "end_turn"));
+    const provider = new AnthropicProvider({ model: MODEL_DEFAULT, client });
+
+    await provider.send(baseRequest([
+      { role: "user", content: [{ type: "text", text: "what's on the timeline?" }] },
+    ]));
+
+    const p = lastParams();
+    assert.equal(p.model, MODEL_DEFAULT);
+    assert.equal(p.system, "You are an editor.");
+    assert.equal(p.max_tokens, 4096);
+    // Tool format: neutral ToolSchema → Anthropic { name, description, input_schema }
+    assert.equal(p.tools?.length, 1);
+    assert.equal(p.tools?.[0]?.name, "query_timeline");
+    assert.ok((p.tools?.[0] as Anthropic.Messages.Tool).input_schema);
+    // Message shape
+    assert.equal(p.messages.length, 1);
+    assert.equal(p.messages[0]?.role, "user");
+    assert.deepEqual(p.messages[0]?.content, [{ type: "text", text: "what's on the timeline?" }]);
+  });
+
+  test("tool_use and tool_result blocks translate to Anthropic wire shape", async () => {
+    const { client, lastParams } = capturingClient(anthropicMessage([{ type: "text", text: "ok", citations: null }], "end_turn"));
+    const provider = new AnthropicProvider({ model: MODEL_DEFAULT, client });
+
+    await provider.send(baseRequest([
+      { role: "assistant", content: [{ type: "tool_use", id: "tu_1", name: "query_timeline", input: { a: 1 } }] },
+      { role: "user", content: [
+        { type: "tool_result", toolUseId: "tu_1", content: "{\"clips\":1}" },
+        { type: "tool_result", toolUseId: "tu_1", content: "boom", isError: true },
+      ] },
+    ]));
+
+    const p = lastParams();
+    const toolUse = (p.messages[0]?.content as any[])[0];
+    assert.deepEqual(toolUse, { type: "tool_use", id: "tu_1", name: "query_timeline", input: { a: 1 } });
+
+    const results = p.messages[1]?.content as any[];
+    // Success result: tool_use_id set, no is_error key (matches pre-slice shape).
+    assert.equal(results[0].type, "tool_result");
+    assert.equal(results[0].tool_use_id, "tu_1");
+    assert.equal(results[0].content, "{\"clips\":1}");
+    assert.ok(!("is_error" in results[0]));
+    // Error result: is_error true.
+    assert.equal(results[1].is_error, true);
+  });
+});
+
+// ── Anthropic response → neutral ─────────────────────────────────────────────
+
+describe("AnthropicProvider — response translation", () => {
+  test("text and tool_use blocks map to neutral blocks", async () => {
+    const { client } = capturingClient(anthropicMessage(
+      [
+        { type: "text", text: "Here is the plan.", citations: null },
+        { type: "tool_use", id: "tu_9", name: "query_timeline", input: {} },
+      ],
+      "tool_use",
+    ));
+    const provider = new AnthropicProvider({ model: MODEL_DEFAULT, client });
+
+    const res = await provider.send(baseRequest([]));
+    assert.equal(res.stopReason, "tool_use");
+    assert.deepEqual(res.content[0], { type: "text", text: "Here is the plan." });
+    assert.deepEqual(res.content[1], { type: "tool_use", id: "tu_9", name: "query_timeline", input: {} });
+  });
+
+  test("stop_reason maps to neutral stop reasons, including max_output", async () => {
+    const cases: Array<[Anthropic.Messages.Message["stop_reason"], string]> = [
+      ["end_turn", "end_turn"],
+      ["tool_use", "tool_use"],
+      ["max_tokens", "max_output"],
+      ["stop_sequence", "other"],
+      [null, "other"],
+    ];
+    for (const [anthropicReason, expected] of cases) {
+      const { client } = capturingClient(anthropicMessage([{ type: "text", text: "x", citations: null }], anthropicReason));
+      const provider = new AnthropicProvider({ model: MODEL_DEFAULT, client });
+      const res = await provider.send(baseRequest([]));
+      assert.equal(res.stopReason, expected, `${anthropicReason} → ${expected}`);
+    }
+  });
+
+  test("usage normalizes reasoningTokens from output_tokens_details.thinking_tokens", async () => {
+    const withThinkingTokens = capturingClient(anthropicMessage(
+      [{ type: "text", text: "x", citations: null }],
+      "end_turn",
+      { input_tokens: 100, output_tokens: 50, output_tokens_details: { thinking_tokens: 20 } as any },
+    ));
+    const p1 = new AnthropicProvider({ model: MODEL_DEFAULT, client: withThinkingTokens.client });
+    const r1 = await p1.send(baseRequest([]));
+    assert.equal(r1.usage.inputTokens, 100);
+    assert.equal(r1.usage.outputTokens, 50);
+    assert.equal(r1.usage.reasoningTokens, 20);
+
+    // Absent when the vendor doesn't report it.
+    const withoutDetails = capturingClient(anthropicMessage(
+      [{ type: "text", text: "x", citations: null }],
+      "end_turn",
+      { input_tokens: 10, output_tokens: 5 },
+    ));
+    const p2 = new AnthropicProvider({ model: MODEL_DEFAULT, client: withoutDetails.client });
+    const r2 = await p2.send(baseRequest([]));
+    assert.equal(r2.usage.reasoningTokens, undefined);
+  });
+});
+
+// ── Reasoning round-trip (define-now, exercise-now) ───────────────────────────
+//
+// Proves the exact path 3E-2.5 depends on, before 3E-2.5 exists: a thinking
+// block survives response→neutral→request byte-identically, signature intact.
+
+describe("AnthropicProvider — reasoning round-trip", () => {
+  test("thinking block → neutral reasoning → back to a byte-identical thinking block", async () => {
+    const thinkingBlock = {
+      type: "thinking",
+      thinking: "The user wants the intro trimmed; check the timeline first.",
+      signature: "EqQBCkYIA...opaque-signature...==",
+    };
+
+    // 1. Response carrying a thinking block → neutral reasoning block.
+    const { client } = capturingClient(anthropicMessage(
+      [thinkingBlock, { type: "tool_use", id: "tu_1", name: "query_timeline", input: {} }],
+      "tool_use",
+    ));
+    const provider = new AnthropicProvider({ model: MODEL_DEFAULT, client });
+    const res = await provider.send(baseRequest([]));
+
+    const reasoning = res.content[0];
+    assert.equal(reasoning?.type, "reasoning");
+    assert.equal((reasoning as any).provider, "anthropic");
+    // Opaque is the whole thinking block, intact; text mirrors the summary.
+    assert.deepEqual((reasoning as any).opaque, thinkingBlock);
+    assert.equal((reasoning as any).text, thinkingBlock.thinking);
+
+    // 2. Feed that neutral reasoning block back through a request.
+    const { client: client2, lastParams } = capturingClient(anthropicMessage([{ type: "text", text: "done", citations: null }], "end_turn"));
+    const provider2 = new AnthropicProvider({ model: MODEL_DEFAULT, client: client2 });
+    await provider2.send(baseRequest([
+      { role: "assistant", content: [reasoning!] },
+    ]));
+
+    // 3. It serializes back to a byte-identical thinking block, signature untouched.
+    const outBlock = (lastParams().messages[0]?.content as any[])[0];
+    assert.deepEqual(outBlock, thinkingBlock);
+    assert.equal(outBlock.signature, thinkingBlock.signature);
+  });
+});
+
+// ── Missing key → fail fast ───────────────────────────────────────────────────
+
+describe("AnthropicProvider — key handling", () => {
+  test("missing ANTHROPIC_API_KEY throws a friendly error", () => {
+    const saved = process.env["ANTHROPIC_API_KEY"];
+    delete process.env["ANTHROPIC_API_KEY"];
+    try {
+      assert.throws(
+        () => new AnthropicProvider(),
+        /ANTHROPIC_API_KEY is not set/,
+      );
+    } finally {
+      if (saved !== undefined) process.env["ANTHROPIC_API_KEY"] = saved;
+    }
+  });
+});

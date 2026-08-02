@@ -355,7 +355,7 @@ describe("/clear", () => {
     const state: ReplState = {
       ...makeState(),
       messages: [
-        { role: "user", content: "earlier prompt" },
+        { role: "user", content: [{ type: "text", text: "earlier prompt" }] },
       ],
     };
     const sessionRef = state.session;
@@ -376,8 +376,11 @@ describe("slash-command continuity", () => {
     assert.equal(r.newState!.messages.length, 1);
     const m = r.newState!.messages[0]!;
     assert.equal(m.role, "user");
-    assert.match(m.content as string, /via slash command/);
-    assert.match(m.content as string, /Trimmed/);
+    // Neutral shape: content is a text-block array, not a bare string.
+    const text = m.content.find((b) => b.type === "text");
+    assert.ok(text && text.type === "text");
+    assert.match(text.text, /via slash command/);
+    assert.match(text.text, /Trimmed/);
   });
 
   test("/timeline (read-only) does NOT inject a synthetic note", async () => {
@@ -402,7 +405,7 @@ describe("agent routing", () => {
     const mockAgent = async (input: import("../agent/loop.js").AgentInput) => {
       captured = { userPrompt: input.userPrompt, autoApprove: input.autoApprove };
       return {
-        messages: [...input.messages, { role: "user" as const, content: input.userPrompt }],
+        messages: [...input.messages, { role: "user" as const, content: [{ type: "text" as const, text: input.userPrompt }] }],
         session: input.session,
         output: "(mocked)",
         isError: false,

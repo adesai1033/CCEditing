@@ -17,7 +17,7 @@ import { GoogleGenAI } from "@google/genai";
 import { TwelveLabs } from "twelvelabs-js";
 import OpenAI from "openai";
 
-import { MODEL_DEFAULT } from "../agent/loop.js";
+import { MODEL_DEFAULT } from "../agent/providers/anthropic.js";
 import { DESCRIBE_MODEL } from "../agent/backends/gemini.js";
 import { MODEL_NAME as TL_MODEL } from "../agent/backends/twelvelabs.js";
 import { WHISPER_MODEL } from "../agent/backends/transcription.js";
