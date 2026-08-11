@@ -2,7 +2,7 @@ import type { ProjectSession } from "../project/session.js";
 import { applyPlan } from "../project/session.js";
 import { buildSystemPrompt } from "./prompt.js";
 import { buildDefaultRegistry, type ToolRegistry } from "./registry.js";
-import { AnthropicProvider } from "./providers/anthropic.js";
+import { buildDefaultProvider } from "./providers/default.js";
 import type {
   ChatProvider,
   ChatResponse,
@@ -17,7 +17,10 @@ import {
 } from "./propose_edit_plan.js";
 
 const MAX_TOOL_CALLS_PER_TURN = 25;
-const MAX_TOKENS = 4096;
+// Thinking tokens count toward the output budget. At 4096, reasoning on a hard
+// request eats the budget and truncates the plan mid-response. Sized to leave
+// room for both the reasoning and the answer. Provider-agnostic.
+const MAX_TOKENS = 16000;
 
 // Neutral block aliases — the loop works exclusively in these.
 type ToolUseBlock = Extract<ContentBlock, { type: "tool_use" }>;
@@ -28,7 +31,8 @@ type ToolResultBlock = Extract<ContentBlock, { type: "tool_result" }>;
 export type ProgressEvent =
   | { type: "tool_call"; name: string; input: unknown }
   | { type: "tool_result"; name: string; ok: boolean; durationMs: number }
-  | { type: "assistant_text"; text: string };
+  | { type: "assistant_text"; text: string }
+  | { type: "thinking"; text: string };
 
 export interface AgentInput {
   userPrompt: string;
@@ -97,7 +101,10 @@ export async function runAgent(input: AgentInput): Promise<AgentResult> {
         messages: state.messages,
         tools,
         maxTokens: MAX_TOKENS,
-        // No reasoning config this slice — extended thinking is off (3E-2.5).
+        // Always-on reasoning. The provider maps this to adaptive thinking; the
+        // model decides per turn whether/how much to think (adaptive skips it on
+        // simple edits). No Anthropic-specific handling reaches this file.
+        reasoning: { enabled: true },
       });
     } catch (err: unknown) {
       return finalize(state, `Agent error: ${(err as Error).message}`, true);
@@ -115,23 +122,36 @@ export async function runAgent(input: AgentInput): Promise<AgentResult> {
       ],
     };
 
-    // Surface any text blocks via progress and remember them for the final
-    // summary. Reasoning blocks are carried in history but not surfaced as text.
+    // Surface blocks via progress in content order (so interleaved reasoning
+    // renders before the tool_call it precedes). Text blocks are also
+    // remembered for the final summary; reasoning blocks are carried in history
+    // but only surfaced as dim thinking progress, never as answer text. In
+    // adaptive mode a turn may contain zero reasoning blocks — do not assume one.
     for (const block of response.content) {
       if (block.type === "text") {
         state.assistantText.push(block.text);
         input.onProgress?.({ type: "assistant_text", text: block.text });
+      } else if (block.type === "reasoning" && block.text && block.text.trim().length > 0) {
+        input.onProgress?.({ type: "thinking", text: block.text });
       }
     }
 
-    if (response.stopReason === "end_turn" || response.stopReason === "max_output") {
-      // `max_output` is treated as a plain end this slice (pre-slice behavior);
-      // 3E-2.5 tightens it.
+    if (response.stopReason === "max_output") {
+      // Reasoning tokens count toward the output budget; truncation here means
+      // the turn was cut off before completing. Surface it, don't swallow it.
+      return finalize(
+        state,
+        "The response was cut off at the output-token limit before finishing. Try narrowing the request.",
+        true,
+      );
+    }
+
+    if (response.stopReason === "end_turn") {
       return finalize(state, null, false);
     }
 
     if (response.stopReason !== "tool_use") {
-      // Unexpected stop reason — bail with the text we have.
+      // Unexpected stop reason ("other") — bail with the text we have.
       return finalize(state, null, false);
     }
 
@@ -405,11 +425,3 @@ function lastUserPromptFrom(messages: NeutralMessage[]): string {
   return "(unknown prompt)";
 }
 
-let cachedProvider: ChatProvider | null = null;
-function buildDefaultProvider(): ChatProvider {
-  // Lazy + cached, mirroring the pre-slice real-client construction: the
-  // fail-fast missing-key error surfaces on first agent turn, not at startup.
-  if (cachedProvider) return cachedProvider;
-  cachedProvider = new AnthropicProvider();
-  return cachedProvider;
-}

@@ -99,6 +99,16 @@ export function App() {
         isError: !event.ok,
         dim: true,
       }]);
+    } else if (event.type === "thinking") {
+      // Dim, distinct from tool-call (→) and assistant text. Only emitted for
+      // non-empty reasoning summaries, so there's no empty container to render.
+      setEntries((prev) => [...prev, {
+        id: crypto.randomUUID(),
+        input: "",
+        output: `✻ thinking… ${event.text}`,
+        isError: false,
+        dim: true,
+      }]);
     } else if (event.type === "assistant_text") {
       setEntries((prev) => [...prev, {
         id: crypto.randomUUID(),

@@ -4,7 +4,12 @@ import type { ProjectState, SourceFile, Clip, Timeline } from "./types.js";
 import type { ProjectSession, Snapshot } from "./session.js";
 import { createSession } from "./session.js";
 
-const SUPPORTED_VERSION = 3;
+// v4 (3E-3): clips gained an optional `userLabel` (the `/label` annotation) and
+// sources gained an optional `analyses.scoutContribution`. Both are additive and
+// optional, so pre-v4 projects load unchanged — every existing clip simply has
+// no user label. No field transforms are needed; the bump records the schema
+// change and lets older readers reject files they don't understand.
+const SUPPORTED_VERSION = 4;
 
 // ── Create ────────────────────────────────────────────────────────────────────
 
@@ -67,7 +72,7 @@ export async function loadProject(filePath: string): Promise<ProjectSession> {
   }
 
   const version = file["version"] as number;
-  if (version !== 1 && version !== 2 && version !== 3) {
+  if (version !== 1 && version !== 2 && version !== 3 && version !== 4) {
     throw new Error(`Unsupported project version ${version} (expected ${SUPPORTED_VERSION})`);
   }
 

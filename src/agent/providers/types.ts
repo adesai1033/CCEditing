@@ -36,8 +36,8 @@ export type ContentBlock =
   // requires for stateful continuation (Anthropic: the whole thinking block
   // including its `signature`), round-tripped UNCHANGED. Nothing outside the
   // owning provider parses it. `text` is a human-readable summary when the
-  // vendor exposes one; it is never authoritative for continuation.
-  // Defined now; NOT produced until 3E-2.5 (thinking stays off this slice).
+  // vendor exposes one (Anthropic summarized thinking); it is never
+  // authoritative for continuation. Produced when reasoning is enabled (3E-2.5).
   | { type: "reasoning"; provider: string; opaque: unknown; text?: string };
 
 export interface NeutralMessage {
@@ -48,13 +48,21 @@ export interface NeutralMessage {
 // ── Request / response ─────────────────────────────────────────────────────────
 
 /**
- * Reasoning configuration slot. Unused this slice (thinking is off); 3E-2.5
- * fills it and each provider maps it to its own vendor parameters. Kept
- * deliberately minimal — this is a placeholder, not the final shape.
+ * Effort is the obvious cross-provider axis — Anthropic and OpenAI both have an
+ * effort/budget notion. Kept to the common three; a provider maps them to its
+ * own scale (Anthropic: output_config.effort). Tuning effort needs telemetry
+ * (3E-9); this slice leaves it unset and lets the provider default it.
+ */
+export type ReasoningEffort = "low" | "medium" | "high";
+
+/**
+ * Reasoning configuration. `enabled` turns thinking on; the provider maps it to
+ * its own reasoning mode (Anthropic: adaptive thinking). `effort` is defined as
+ * the cross-provider steering axis but intentionally left unset this slice.
  */
 export interface ReasoningConfig {
-  enabled?: boolean;
-  budgetTokens?: number;
+  enabled: boolean;
+  effort?: ReasoningEffort;
 }
 
 export interface ChatRequest {
@@ -63,15 +71,15 @@ export interface ChatRequest {
   /** The registry's neutral tool schemas; the provider translates them. */
   tools: ToolSchema[];
   maxTokens: number;
-  /** None this slice; filled by 3E-2.5. */
+  /** When enabled, the provider turns on its reasoning mode (3E-2.5). */
   reasoning?: ReasoningConfig;
 }
 
 /**
  * Neutral stop reasons. The loop branches on THESE, never on vendor strings.
- * `max_output` (vendor "max_tokens" / truncation) is mapped explicitly because
- * it becomes load-bearing in 3E-2.5; this slice treats it exactly like
- * `end_turn`, matching pre-slice behavior.
+ * `max_output` (vendor "max_tokens" / truncation) is load-bearing once thinking
+ * is on: reasoning tokens count toward the output budget, so truncation is a
+ * real failure the loop surfaces as an error rather than a silent cutoff.
  */
 export type NeutralStopReason = "end_turn" | "tool_use" | "max_output" | "other";
 

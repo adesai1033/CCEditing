@@ -15,6 +15,7 @@ import {
   redoSession,
   type ProjectSession,
 } from "../../project/session.js";
+import { setClipUserLabel, clearClipUserLabel } from "../../project/mutations.js";
 import { loadOrCreateProject, saveProjectToStandardPath } from "../../cli/project-context.js";
 import { parseTime } from "../../utils/time.js";
 import { execute } from "../../engine/engine.js";
@@ -75,6 +76,8 @@ export async function dispatch(
     case "move":     return withSlashContinuity(await dispatchMove(args, state), state);
     case "split":    return withSlashContinuity(await dispatchSplit(args, state), state);
     case "delete":   return withSlashContinuity(await dispatchDelete(args, state), state);
+    case "label":    return withSlashContinuity(await dispatchLabel(args, state), state);
+    case "unlabel":  return withSlashContinuity(await dispatchUnlabel(args, state), state);
     case "undo":     return withSlashContinuity(await dispatchUndo(state), state);
     case "redo":     return withSlashContinuity(await dispatchRedo(state), state);
     case "export":   return dispatchExport(args, state);
@@ -317,6 +320,73 @@ async function dispatchDelete(args: string[], state: ReplState): Promise<Dispatc
     output: `Deleted ${clip.label}  ·  ${remaining} clip${remaining === 1 ? "" : "s"} remaining`,
     isError: false,
     newState: { ...state, session: result.session },
+  };
+}
+
+// ── /label & /unlabel ─────────────────────────────────────────────────────────
+//
+// User annotations, NOT edit operations: they don't go through applyPlan and
+// don't create undo entries. `/label <ref>` with no text shows the current
+// label; with text sets/replaces it; `/unlabel <ref>` clears it.
+
+async function dispatchLabel(args: string[], state: ReplState): Promise<DispatchResult> {
+  if (!state.session) return { output: "No project open. Use /open first.", isError: true };
+  if (!args[0]) return { output: "Usage: /label <clip> [text]   (omit text to show the current label)", isError: true };
+
+  const clip = resolveClip(state.session.state.timeline, args[0]);
+  if (!clip) {
+    const count = clipsInOrder(state.session.state.timeline).length;
+    return { output: `Clip "${args[0]}" not found (1–${count})`, isError: true };
+  }
+  const ref = getClipDisplayRefs(state.session.state.timeline).get(clip.id) ?? args[0];
+
+  // Show mode: no text provided.
+  if (args.length < 2) {
+    return {
+      output: clip.userLabel ? `[${ref}] label: ${clip.userLabel}` : `[${ref}] has no label.`,
+      isError: false,
+    };
+  }
+
+  const text = args.slice(1).join(" ");
+  const result = setClipUserLabel(state.session.state, clip.id, text);
+  if (!result.ok) return { output: `Error: ${result.error}`, isError: true };
+
+  const session: ProjectSession = { ...state.session, state: result.state };
+  const saved = await saveProjectToStandardPath(session);
+  if (!saved.ok) return { output: `Error saving project: ${saved.error}`, isError: true };
+
+  return {
+    output: `Labeled [${ref}]: ${text.trim()}`,
+    isError: false,
+    newState: { ...state, session },
+  };
+}
+
+async function dispatchUnlabel(args: string[], state: ReplState): Promise<DispatchResult> {
+  if (!state.session) return { output: "No project open. Use /open first.", isError: true };
+  if (!args[0]) return { output: "Usage: /unlabel <clip>", isError: true };
+
+  const clip = resolveClip(state.session.state.timeline, args[0]);
+  if (!clip) {
+    const count = clipsInOrder(state.session.state.timeline).length;
+    return { output: `Clip "${args[0]}" not found (1–${count})`, isError: true };
+  }
+  const ref = getClipDisplayRefs(state.session.state.timeline).get(clip.id) ?? args[0];
+
+  if (!clip.userLabel) return { output: `[${ref}] had no label.`, isError: false };
+
+  const result = clearClipUserLabel(state.session.state, clip.id);
+  if (!result.ok) return { output: `Error: ${result.error}`, isError: true };
+
+  const session: ProjectSession = { ...state.session, state: result.state };
+  const saved = await saveProjectToStandardPath(session);
+  if (!saved.ok) return { output: `Error saving project: ${saved.error}`, isError: true };
+
+  return {
+    output: `Cleared label on [${ref}]`,
+    isError: false,
+    newState: { ...state, session },
   };
 }
 

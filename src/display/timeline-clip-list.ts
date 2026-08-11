@@ -38,7 +38,8 @@ export function renderClipList(state: ProjectState): string {
     const nameStr  = chalk.white(name.padEnd(24));
     const range    = chalk.dim(`${formatDuration(clip.inPoint)} → ${formatDuration(clip.outPoint)}`);
     const dur      = chalk.dim(`(${formatSeconds(duration)})`);
-    return `  ${index} ${nameStr} ${range}  ${dur}`;
+    const tag      = clip.userLabel ? "  " + chalk.dim(`♦ ${clip.userLabel}`) : "";
+    return `  ${index} ${nameStr} ${range}  ${dur}${tag}`;
   });
 
   return lines.join("\n");

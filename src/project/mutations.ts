@@ -247,6 +247,10 @@ export function splitClip(
     prevId: clip.id,
     nextId: clip.nextId,
     splitGroupId: groupId,
+    // Both halves of a split inherit the user label: a "good take" that gets
+    // split is still, in both halves, part of that take. The user can /unlabel
+    // a half if a split was made specifically to discard part of it.
+    ...(clip.userLabel !== undefined ? { userLabel: clip.userLabel } : {}),
   };
 
   // Shorten original clip, assign its groupId, and wire it to the new second clip
@@ -291,6 +295,58 @@ export function renameClip(
       timeline: {
         ...state.timeline,
         clips: setClip(state.timeline.clips, { ...clip, label: label.trim() }),
+      },
+    }),
+  };
+}
+
+/**
+ * Set (or replace) a clip's user label — the `/label` annotation (3E-3).
+ * This is user data, distinct from the display `label`, and is NOT routed
+ * through applyPlan/Operations: labels are never agent-written and don't belong
+ * in the edit-operation vocabulary. Empty/whitespace text is rejected; use
+ * clearClipUserLabel to remove a label.
+ */
+export function setClipUserLabel(
+  state: ProjectState,
+  clipId: string,
+  text: string,
+): MutationResult {
+  const clip = findClip(state, clipId);
+  if (!clip) return { ok: false, error: `Clip not found: ${clipId}` };
+
+  const trimmed = text.trim();
+  if (!trimmed) return { ok: false, error: `Label cannot be empty` };
+
+  return {
+    ok: true,
+    state: touch({
+      ...state,
+      timeline: {
+        ...state.timeline,
+        clips: setClip(state.timeline.clips, { ...clip, userLabel: trimmed }),
+      },
+    }),
+  };
+}
+
+/**
+ * Clear a clip's user label (the `/unlabel` command).
+ */
+export function clearClipUserLabel(state: ProjectState, clipId: string): MutationResult {
+  const clip = findClip(state, clipId);
+  if (!clip) return { ok: false, error: `Clip not found: ${clipId}` };
+
+  const next = { ...clip };
+  delete next.userLabel;
+
+  return {
+    ok: true,
+    state: touch({
+      ...state,
+      timeline: {
+        ...state.timeline,
+        clips: setClip(state.timeline.clips, next),
       },
     }),
   };

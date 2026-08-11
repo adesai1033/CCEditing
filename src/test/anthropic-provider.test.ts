@@ -205,17 +205,93 @@ describe("AnthropicProvider — reasoning round-trip", () => {
     assert.deepEqual((reasoning as any).opaque, thinkingBlock);
     assert.equal((reasoning as any).text, thinkingBlock.thinking);
 
-    // 2. Feed that neutral reasoning block back through a request.
+    // 2. Feed that neutral reasoning block back through a request — alongside a
+    // text block and a tool_use block, the real multi-block assistant-turn shape.
     const { client: client2, lastParams } = capturingClient(anthropicMessage([{ type: "text", text: "done", citations: null }], "end_turn"));
     const provider2 = new AnthropicProvider({ model: MODEL_DEFAULT, client: client2 });
     await provider2.send(baseRequest([
-      { role: "assistant", content: [reasoning!] },
+      { role: "assistant", content: [
+        reasoning!,
+        { type: "text", text: "Let me check the timeline." },
+        { type: "tool_use", id: "tu_1", name: "query_timeline", input: {} },
+      ] },
     ]));
 
-    // 3. It serializes back to a byte-identical thinking block, signature untouched.
-    const outBlock = (lastParams().messages[0]?.content as any[])[0];
-    assert.deepEqual(outBlock, thinkingBlock);
-    assert.equal(outBlock.signature, thinkingBlock.signature);
+    // 3. The thinking block serializes back byte-identical, signature untouched,
+    // and its siblings translate to their normal wire shapes in order.
+    const outContent = lastParams().messages[0]?.content as any[];
+    assert.deepEqual(outContent[0], thinkingBlock);
+    assert.equal(outContent[0].signature, thinkingBlock.signature);
+    assert.deepEqual(outContent[1], { type: "text", text: "Let me check the timeline." });
+    assert.deepEqual(outContent[2], { type: "tool_use", id: "tu_1", name: "query_timeline", input: {} });
+  });
+});
+
+// ── Reasoning config → adaptive thinking (3E-2.5) ─────────────────────────────
+
+describe("AnthropicProvider — reasoning config mapping", () => {
+  test("reasoning { enabled: true } → thinking adaptive + display summarized, no header, no budget", async () => {
+    const { client, lastParams } = capturingClient(anthropicMessage([{ type: "text", text: "ok", citations: null }], "end_turn"));
+    const provider = new AnthropicProvider({ model: MODEL_DEFAULT, client });
+
+    await provider.send({ ...baseRequest([]), reasoning: { enabled: true } });
+
+    const p = lastParams() as any;
+    assert.deepEqual(p.thinking, { type: "adaptive", display: "summarized" });
+    // Adaptive uses no manual budget and needs no interleaved beta header.
+    assert.ok(!("budget_tokens" in p.thinking), "adaptive must not carry a manual budget");
+    assert.equal(p.output_config, undefined, "effort unset this slice → no output_config");
+  });
+
+  test("effort, when present, maps to output_config.effort (future-proofing)", async () => {
+    const { client, lastParams } = capturingClient(anthropicMessage([{ type: "text", text: "ok", citations: null }], "end_turn"));
+    const provider = new AnthropicProvider({ model: MODEL_DEFAULT, client });
+
+    await provider.send({ ...baseRequest([]), reasoning: { enabled: true, effort: "low" } });
+
+    const p = lastParams() as any;
+    assert.deepEqual(p.thinking, { type: "adaptive", display: "summarized" });
+    assert.deepEqual(p.output_config, { effort: "low" });
+  });
+
+  test("reasoning absent or disabled → no thinking param", async () => {
+    for (const reasoning of [undefined, { enabled: false } as const]) {
+      const { client, lastParams } = capturingClient(anthropicMessage([{ type: "text", text: "ok", citations: null }], "end_turn"));
+      const provider = new AnthropicProvider({ model: MODEL_DEFAULT, client });
+      await provider.send({ ...baseRequest([]), reasoning });
+      const p = lastParams() as any;
+      assert.equal(p.thinking, undefined);
+      assert.equal(p.output_config, undefined);
+    }
+  });
+
+  test("a summarized-thinking response maps to a neutral reasoning block with text + opaque intact", async () => {
+    const thinkingBlock = {
+      type: "thinking",
+      thinking: "Two ops: reorder then trim. Reorder first so indices stay valid.",
+      signature: "sig-abc==",
+    };
+    const { client } = capturingClient(anthropicMessage(
+      [
+        thinkingBlock,
+        { type: "text", text: "Here's the plan.", citations: null },
+        { type: "tool_use", id: "tu_1", name: "query_timeline", input: {} },
+      ],
+      "tool_use",
+    ));
+    const provider = new AnthropicProvider({ model: MODEL_DEFAULT, client });
+
+    const res = await provider.send({ ...baseRequest([]), reasoning: { enabled: true } });
+
+    // Reasoning block: text populated from the summarized thinking, opaque intact.
+    const reasoning = res.content[0] as any;
+    assert.equal(reasoning.type, "reasoning");
+    assert.equal(reasoning.provider, "anthropic");
+    assert.equal(reasoning.text, thinkingBlock.thinking);
+    assert.deepEqual(reasoning.opaque, thinkingBlock);
+    // The text and tool_use blocks alongside it map normally.
+    assert.deepEqual(res.content[1], { type: "text", text: "Here's the plan." });
+    assert.deepEqual(res.content[2], { type: "tool_use", id: "tu_1", name: "query_timeline", input: {} });
   });
 });
 

@@ -44,6 +44,26 @@ export interface SourceAnalyses {
   // Keyed by (thresholdDb, minDuration) — a -35dB result must never satisfy a
   // -50dB request, so entries accumulate rather than overwrite.
   silences?: SilenceCacheEntry[];
+  // A scout's distilled, bounded perception of this source (3E-3). Cached so a
+  // survey reuses it instead of re-perceiving/re-distilling on every planning
+  // turn. Only complete contributions are cached; a failed scout leaves this
+  // unset so the next survey retries. Derived, never authoritative content.
+  scoutContribution?: ScoutContribution;
+}
+
+/**
+ * One source's distilled contribution to a ContentMap (3E-3), produced by a
+ * read-only scout in its own context. Bounded (caps on outline/moment counts);
+ * `truncated` marks that caps elided detail. Holds source-derived perception
+ * only — the per-clip user label is layered in at reduce time, not stored here.
+ */
+export interface ScoutContribution {
+  outline: Array<{ start: number; end: number; gist: string }>;
+  keyMoments: Array<{ time: number; gist: string }>;
+  topicBeats?: Array<{ start: number; end: number; gist: string }>;
+  silences?: Array<{ start: number; end: number }>;
+  truncated?: boolean;
+  generatedAt: string;      // ISO timestamp
 }
 
 export interface TranscriptSegment {
@@ -95,6 +115,11 @@ export interface Clip {
   // All siblings (and their further-split descendants) share the same groupId.
   // null means the clip was never split.
   splitGroupId: string | null;
+  // User-authored annotation set via `/label` (3E-3). Distinct from `label`
+  // (the display name). NEVER agent-written; the agent may read and act on it.
+  // Absent when the clip has no annotation. Lifecycle: split → both halves
+  // inherit; trim/move → kept; delete → dropped with the clip.
+  userLabel?: string;
 }
 
 export interface Timeline {

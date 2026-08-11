@@ -5,10 +5,12 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { dispatch, type ReplState } from "../repl/commands/dispatch.js";
-import { createProject } from "../project/io.js";
+import { createProject, loadProject } from "../project/io.js";
 import { addSource } from "../project/mutations.js";
 import { createSession } from "../project/session.js";
 import { clipsInOrder } from "../project/types.js";
+import { loadOrCreateProject, projectFilePath } from "../cli/project-context.js";
+import { writeFileSync } from "node:fs";
 import type { MediaInfo } from "../media/types.js";
 
 // ── Setup: redirect .cutcli.json writes to a temp dir ─────────────────────────
@@ -447,5 +449,128 @@ describe("/export error paths", () => {
     const r = await dispatch("/export out.mp4", { session: createSession(createProject("test")), messages: [], autoApprove: false });
     assert.equal(r.isError, true);
     assert.match(r.output, /empty/);
+  });
+});
+
+// ── /label & /unlabel (3E-3) ──────────────────────────────────────────────────
+
+describe("/label & /unlabel", () => {
+  test("sets, shows, and clears a clip's user label", async () => {
+    const state = makeState();
+
+    const set = await dispatch("/label 1 good take", state);
+    assert.equal(set.isError, false);
+    assert.match(set.output, /Labeled \[1\]: good take/);
+    assert.equal(clipsInOrder(set.newState!.session!.state.timeline)[0]!.userLabel, "good take");
+
+    // Show mode (no text) — read-only, reports the label, injects no continuity note.
+    const show = await dispatch("/label 1", set.newState!);
+    assert.equal(show.isError, false);
+    assert.match(show.output, /good take/);
+    assert.equal(show.newState, undefined);
+
+    const clear = await dispatch("/unlabel 1", set.newState!);
+    assert.equal(clear.isError, false);
+    assert.match(clear.output, /Cleared label/);
+    assert.equal(clipsInOrder(clear.newState!.session!.state.timeline)[0]!.userLabel, undefined);
+  });
+
+  test("errors for unknown clip and reports when nothing to clear", async () => {
+    const notFound = await dispatch("/label 99 x", makeState());
+    assert.equal(notFound.isError, true);
+    assert.match(notFound.output, /not found/);
+
+    const nothing = await dispatch("/unlabel 1", makeState());
+    assert.equal(nothing.isError, false);
+    assert.match(nothing.output, /had no label/);
+  });
+
+  test("/label injects the continuity note; show mode does not", async () => {
+    const state = makeState();
+    const r = await dispatch("/label 1 good take", state);
+    assert.equal(r.newState!.messages.length, 1);
+    const text = r.newState!.messages[0]!.content.find((b) => b.type === "text");
+    assert.ok(text && text.type === "text");
+    assert.match(text.text, /via slash command/);
+    assert.match(text.text, /Labeled/);
+
+    const show = await dispatch("/label 1", r.newState!);
+    // Show mode returns no newState → no synthetic message appended.
+    assert.equal(show.newState, undefined);
+  });
+
+  test("label persists across save/load", async () => {
+    const state = makeState();
+    await dispatch("/label 1 keeper", state);
+    // dispatch saved to the standard path; reload it fresh.
+    const ctx = await loadOrCreateProject();
+    assert.ok(ctx.ok && ctx.existed);
+    assert.equal(clipsInOrder(ctx.session.state.timeline)[0]!.userLabel, "keeper");
+  });
+});
+
+// ── Label lifecycle across edits ──────────────────────────────────────────────
+
+describe("label lifecycle", () => {
+  test("split propagates the label to both halves", async () => {
+    const labeled = await dispatch("/label 1 good take", makeState());
+    const split = await dispatch("/split 1 60", labeled.newState!);
+    assert.equal(split.isError, false);
+    const ordered = clipsInOrder(split.newState!.session!.state.timeline);
+    assert.equal(ordered.length, 2);
+    assert.equal(ordered[0]!.userLabel, "good take");
+    assert.equal(ordered[1]!.userLabel, "good take");
+  });
+
+  test("trim keeps the label", async () => {
+    const labeled = await dispatch("/label 1 keep", makeState());
+    const trimmed = await dispatch("/trim 1 0 30", labeled.newState!);
+    assert.equal(clipsInOrder(trimmed.newState!.session!.state.timeline)[0]!.userLabel, "keep");
+  });
+
+  test("move keeps the label", async () => {
+    const labeled = await dispatch("/label 1 keep", makeState(2));
+    const moved = await dispatch("/move 1 2", labeled.newState!);
+    const movedClip = clipsInOrder(moved.newState!.session!.state.timeline).find((c) => c.userLabel === "keep");
+    assert.ok(movedClip, "the moved clip still carries its label");
+  });
+
+  test("delete drops the label with the clip", async () => {
+    const labeled = await dispatch("/label 1 gone", makeState(2));
+    const deleted = await dispatch("/delete 1", labeled.newState!);
+    const remaining = clipsInOrder(deleted.newState!.session!.state.timeline);
+    assert.equal(remaining.length, 1);
+    assert.equal(remaining[0]!.userLabel, undefined);
+  });
+});
+
+// ── Pre-label (v3) project migrates clean ─────────────────────────────────────
+
+describe("v4 migration", () => {
+  test("a pre-label v3 project loads clean with no user labels", async () => {
+    // Hand-write a minimal v3 project (no userLabel field anywhere).
+    const clipId = "clip-1";
+    const srcId = "src-1";
+    const v3 = {
+      version: 3,
+      name: "old",
+      createdAt: "2020-01-01T00:00:00.000Z",
+      updatedAt: "2020-01-01T00:00:00.000Z",
+      sources: [{
+        id: srcId, filePath: "/x.mp4", fileName: "x.mp4", duration: 100,
+        width: 1920, height: 1080, fps: 30, videoCodec: "h264", audioCodec: "aac",
+        fileSize: 1, analyses: {},
+      }],
+      timeline: {
+        headId: clipId, tailId: clipId,
+        clips: { [clipId]: { id: clipId, sourceId: srcId, inPoint: 0, outPoint: 100, label: "x.mp4", prevId: null, nextId: null, splitGroupId: null } },
+      },
+      undo: [], redo: [],
+    };
+    writeFileSync(projectFilePath(), JSON.stringify(v3), "utf-8");
+
+    const session = await loadProject(projectFilePath());
+    assert.equal(session.state.version, 4);
+    assert.equal(clipsInOrder(session.state.timeline)[0]!.userLabel, undefined);
   });
 });

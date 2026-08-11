@@ -15,6 +15,7 @@ export interface QueryTimelineOutput {
     outPoint: number;
     duration: number;
     label: string;
+    userLabel: string | null;           // user's /label annotation, if any
     sourceDescription: string | null;  // populated if describe_clip has run
     // Media constraints — lets the agent reject impossible requests (e.g.
     // "remove the silent part" on a source with audioCodec === null) and
@@ -45,6 +46,7 @@ async function execute(state: ProjectState, _input: QueryTimelineInput): Promise
       outPoint: c.outPoint,
       duration: c.outPoint - c.inPoint,
       label: c.label,
+      userLabel: c.userLabel ?? null,
       sourceDescription: source?.analyses.description?.text ?? null,
       width: source?.width ?? 0,
       height: source?.height ?? 0,
@@ -64,8 +66,9 @@ const schema: ToolSchema = {
   name: "query_timeline",
   description:
     "Returns the current timeline as an ordered list of clips with display refs " +
-    "(e.g. '1', '2a'), source filenames, in/out points, durations, cached Gemini " +
-    "descriptions if available, plus media constraints per source (resolution, " +
+    "(e.g. '1', '2a'), source filenames, in/out points, durations, any user " +
+    "`/label` annotations, cached Gemini descriptions if available, plus media " +
+    "constraints per source (resolution, " +
     "fps, codecs, audio presence). Call this first when planning edits so you " +
     "know what clips exist, what content they hold, and what's technically possible.",
   input_schema: { type: "object", properties: {} },

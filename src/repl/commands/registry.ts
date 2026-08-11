@@ -10,6 +10,8 @@ export const COMMANDS: CommandDef[] = [
   { name: "move",     syntax: "/move <from> <to>",           description: "Move a clip to a new position (1-based indices)" },
   { name: "split",    syntax: "/split <clip> <time>",        description: "Split a clip at a source time into two clips" },
   { name: "delete",   syntax: "/delete <clip>",              description: "Remove a clip from the timeline" },
+  { name: "label",    syntax: "/label <clip> [text]",        description: "Annotate a clip (omit text to show); the agent can act on it" },
+  { name: "unlabel",  syntax: "/unlabel <clip>",             description: "Clear a clip's annotation" },
   { name: "undo",     syntax: "/undo",                       description: "Undo the most recent change" },
   { name: "redo",     syntax: "/redo",                       description: "Redo the most recently undone change" },
   { name: "timeline", syntax: "/timeline",                   description: "Show the current timeline" },

@@ -4,8 +4,12 @@ import assert from "node:assert/strict";
 import { runAgent } from "../agent/loop.js";
 import type { ChatProvider, ChatResponse, ContentBlock } from "../agent/providers/types.js";
 import { buildDefaultRegistry } from "../agent/registry.js";
+import type { ToolSchema } from "../agent/types.js";
+import type { ContentMap } from "../agent/content-map.js";
 import { transcribeAudio } from "../agent/tools/transcribe_audio.js";
 import { detectSilence } from "../agent/tools/detect_silence.js";
+import { queryTimeline } from "../agent/tools/query_timeline.js";
+import { setClipUserLabel } from "../project/mutations.js";
 import { createSession } from "../project/session.js";
 import { createProject } from "../project/io.js";
 import { addSource } from "../project/mutations.js";
@@ -47,6 +51,27 @@ function mockProvider(responses: ChatResponse[]): ChatProvider {
       if (!r) throw new Error(`mockProvider exhausted at call ${i}`);
       return r;
     },
+  };
+}
+
+// Like mockProvider but also records every ChatRequest the loop builds, so we
+// can assert what the loop asks for (reasoning config, maxTokens).
+function capturingProvider(responses: ChatResponse[]): {
+  provider: ChatProvider;
+  requests: import("../agent/providers/types.js").ChatRequest[];
+} {
+  const requests: import("../agent/providers/types.js").ChatRequest[] = [];
+  let i = 0;
+  return {
+    provider: {
+      send: async (req) => {
+        requests.push(req);
+        const r = responses[i++];
+        if (!r) throw new Error(`capturingProvider exhausted at call ${i}`);
+        return r;
+      },
+    },
+    requests,
   };
 }
 
@@ -321,6 +346,168 @@ describe("runAgent — reasoning-block tolerance", () => {
   });
 });
 
+// ── Extended thinking (3E-2.5) ────────────────────────────────────────────────
+
+describe("runAgent — extended thinking", () => {
+  test("the loop asks the provider for reasoning and a raised max-output budget", async () => {
+    const { session } = makeSession();
+    const { provider, requests } = capturingProvider([endTurn("OK.")]);
+
+    await runAgent({
+      userPrompt: "hi",
+      session,
+      messages: [],
+      autoApprove: false,
+      confirm: noConfirm(),
+      provider,
+    });
+
+    assert.equal(requests.length, 1);
+    assert.deepEqual(requests[0]!.reasoning, { enabled: true });
+    // Thinking tokens count toward the budget — must be above the old 4096.
+    assert.ok(requests[0]!.maxTokens > 4096, `maxTokens ${requests[0]!.maxTokens} must exceed 4096`);
+  });
+
+  test("max_output stop reason is an explicit error, not a silent end", async () => {
+    const { session } = makeSession();
+    const provider = mockProvider([
+      {
+        content: [{ type: "text", text: "partial answer that got cut" }],
+        stopReason: "max_output",
+        usage: { inputTokens: 0, outputTokens: 16000 },
+      },
+    ]);
+
+    const r = await runAgent({
+      userPrompt: "do a huge thing",
+      session,
+      messages: [],
+      autoApprove: false,
+      confirm: noConfirm(),
+      provider,
+    });
+
+    assert.equal(r.isError, true, "max_output must surface as an error");
+    assert.match(r.output, /cut off|output-token limit|narrow/i);
+  });
+
+  test("a turn with no reasoning block is handled with no error and no thinking event", async () => {
+    const { session } = makeSession();
+    const provider = mockProvider([endTurn("Trimmed the first 2 seconds.")]);
+
+    const events: string[] = [];
+    const r = await runAgent({
+      userPrompt: "trim the first 2 seconds",
+      session,
+      messages: [],
+      autoApprove: false,
+      confirm: noConfirm(),
+      onProgress: (e) => events.push(e.type),
+      provider,
+    });
+
+    assert.equal(r.isError, false);
+    assert.ok(!events.includes("thinking"), "adaptive skipped thinking → no thinking event");
+  });
+
+  test("a reasoning block with empty text emits no thinking event and does not crash", async () => {
+    const { session } = makeSession();
+    const provider = mockProvider([
+      {
+        content: [
+          { type: "reasoning", provider: "anthropic", opaque: { type: "thinking", thinking: "", signature: "s" }, text: "" },
+          { type: "text", text: "Done." },
+        ],
+        stopReason: "end_turn",
+        usage: { inputTokens: 0, outputTokens: 0 },
+      },
+    ]);
+
+    const events: string[] = [];
+    const r = await runAgent({
+      userPrompt: "hello",
+      session,
+      messages: [],
+      autoApprove: false,
+      confirm: noConfirm(),
+      onProgress: (e) => events.push(e.type),
+      provider,
+    });
+
+    assert.equal(r.isError, false);
+    assert.ok(!events.includes("thinking"), "empty reasoning text must not emit a thinking event");
+  });
+
+  test("thinking progress is emitted before the tool_call it precedes", async () => {
+    const { session } = makeSession();
+    const provider = mockProvider([
+      {
+        content: [
+          { type: "reasoning", provider: "anthropic", opaque: { type: "thinking", thinking: "Check the timeline first.", signature: "s" }, text: "Check the timeline first." },
+          { type: "tool_use", id: "tu_qt", name: "query_timeline", input: {} },
+        ],
+        stopReason: "tool_use",
+        usage: { inputTokens: 0, outputTokens: 0 },
+      },
+      endTurn("One clip."),
+    ]);
+
+    const ordered: string[] = [];
+    const r = await runAgent({
+      userPrompt: "what's on the timeline?",
+      session,
+      messages: [],
+      autoApprove: false,
+      confirm: noConfirm(),
+      onProgress: (e) => ordered.push(e.type),
+      provider,
+    });
+
+    assert.equal(r.isError, false);
+    const think = ordered.indexOf("thinking");
+    const call = ordered.indexOf("tool_call");
+    assert.ok(think >= 0 && call >= 0, "both events present");
+    assert.ok(think < call, "thinking must precede the tool_call");
+  });
+
+  test("reasoning + propose_edit_plan applies under auto-approve with the label intact", async () => {
+    const { session, clipId } = makeSession();
+    const provider = mockProvider([
+      {
+        content: [
+          { type: "reasoning", provider: "anthropic", opaque: { type: "thinking", thinking: "Trim to 30.", signature: "s" }, text: "Trim to 30." },
+          { type: "tool_use", id: "tu_plan", name: "propose_edit_plan", input: {
+            summary: "Trim the start.",
+            operations: [{ type: "trim", clipId, inPoint: 0, outPoint: 30 }],
+          } },
+        ],
+        stopReason: "tool_use",
+        usage: { inputTokens: 0, outputTokens: 0 },
+      },
+      endTurn("Done."),
+    ]);
+
+    const r = await runAgent({
+      userPrompt: "trim clip 1 to 30 seconds",
+      session,
+      messages: [],
+      autoApprove: true,
+      confirm: noConfirm(),
+      provider,
+    });
+
+    assert.equal(r.isError, false);
+    assert.equal(clipsInOrder(r.session.state.timeline)[0]!.outPoint, 30);
+    assert.equal(r.session.undo.length, 1);
+    assert.equal(r.session.undo[0]!.label, "trim clip 1 to 30 seconds");
+    // The reasoning block preceding the plan is preserved in history.
+    const assistantTurn = r.messages.find(
+      (m) => m.role === "assistant" && m.content.some((b) => b.type === "reasoning"),
+    );
+    assert.ok(assistantTurn);
+  });
+});
+
 // ── Audio tools (3E-2) ────────────────────────────────────────────────────────
 //
 // The architectural guard for the slice: these turns dispatch audio tools with
@@ -507,5 +694,133 @@ describe("runAgent — audio tools", () => {
     assert.equal(r.isError, false, "no audio is a normal answer, not a failure");
     assert.match(r.output, /no audio track/);
     assert.equal(r.session.undo.length, 0, "nothing was applied");
+  });
+});
+
+// ── Narrative planning via survey_sources (3E-3) ──────────────────────────────
+//
+// The director loop is UNCHANGED by 3E-3: survey_sources dispatches through the
+// registry like any other tool, and a narrative plan is one propose_edit_plan
+// with many operations. These tests mock survey_sources at the registry seam so
+// the director's own behaviour is what's exercised (the fan-out is tested in
+// survey-sources.test.ts).
+
+const SURVEY_SCHEMA: ToolSchema = {
+  name: "survey_sources",
+  description: "mock",
+  input_schema: { type: "object", properties: {} },
+};
+
+function registryWithMockedSurvey(map: ContentMap) {
+  const calls: unknown[] = [];
+  const registry = buildDefaultRegistry();
+  registry.registerDirectorTool({
+    schema: SURVEY_SCHEMA,
+    execute: async (_state, input) => { calls.push(input); return { ok: true, result: map }; },
+  });
+  return { registry, calls };
+}
+
+function cannedMap(sourceId: string): ContentMap {
+  return {
+    sources: [{
+      sourceId, displayRef: "1", duration: 120,
+      outline: [{ start: 0, end: 4, gist: "flat intro" }, { start: 4, end: 120, gist: "the good part" }],
+      keyMoments: [{ time: 4, gist: "strongest moment" }],
+    }],
+    truncated: false,
+  };
+}
+
+describe("runAgent — narrative planning", () => {
+  test("survey_sources → multi-op propose_edit_plan applies as ONE undo entry", async () => {
+    const { session, clipId } = makeSession();
+    const { registry, calls } = registryWithMockedSurvey(cannedMap(session.state.sources[0]!.id));
+
+    const provider = mockProvider([
+      toolUse("survey_sources", {}, "tu_survey"),
+      // A narrative plan: several operations in ONE propose_edit_plan call.
+      toolUse("propose_edit_plan", {
+        summary: "Open on the strongest moment and tighten.",
+        operations: [
+          { type: "trim", clipId, inPoint: 4, outPoint: 34 },
+        ],
+      }, "tu_plan"),
+      endTurn("Tightened to 30s opening on the strongest moment."),
+    ]);
+
+    const r = await runAgent({
+      userPrompt: "tighten this to about 30 seconds, open on the strongest moment, cut anything flat",
+      session,
+      messages: [],
+      autoApprove: true,
+      confirm: noConfirm(),
+      provider,
+      registry,
+    });
+
+    assert.equal(r.isError, false);
+    assert.equal(calls.length, 1, "survey_sources was called once");
+    // One undo entry for the whole narrative plan, labeled with the user's words.
+    assert.equal(r.session.undo.length, 1);
+    assert.equal(r.session.undo[0]!.label, "tighten this to about 30 seconds, open on the strongest moment, cut anything flat");
+    assert.equal(clipsInOrder(r.session.state.timeline)[0]!.inPoint, 4);
+  });
+
+  test("the plan is submitted after the survey result is in history", async () => {
+    const { session, clipId } = makeSession();
+    const { registry } = registryWithMockedSurvey(cannedMap(session.state.sources[0]!.id));
+
+    const provider = mockProvider([
+      toolUse("survey_sources", {}, "tu_survey"),
+      toolUse("propose_edit_plan", {
+        summary: "Trim.",
+        operations: [{ type: "trim", clipId, inPoint: 4, outPoint: 34 }],
+      }, "tu_plan"),
+      endTurn("Done."),
+    ]);
+
+    const r = await runAgent({
+      userPrompt: "tighten and open strong",
+      session, messages: [], autoApprove: true, confirm: noConfirm(), provider, registry,
+    });
+
+    assert.equal(r.isError, false);
+    // History contains the survey tool_result before the applied plan's result.
+    const flat = r.messages.flatMap((m) => m.content.map((b) => b.type + (b.type === "tool_use" ? `:${(b as { name: string }).name}` : "")));
+    const surveyIdx = flat.indexOf("tool_use:survey_sources");
+    const planIdx = flat.indexOf("tool_use:propose_edit_plan");
+    assert.ok(surveyIdx >= 0 && planIdx >= 0 && surveyIdx < planIdx, "survey precedes the plan in history");
+  });
+
+  test("a /label'd clip is visible to the director and can be targeted", async () => {
+    const { session, clipId } = makeSession();
+    // User labels the clip; the plan then targets it by id.
+    const labeled = setClipUserLabel(session.state, clipId, "good take");
+    assert.ok(labeled.ok);
+    const labeledSession = { ...session, state: labeled.state };
+
+    // The label is surfaced through query_timeline — the director's channel for it.
+    const q = await queryTimeline.execute(labeled.state, {});
+    assert.ok(q.ok);
+    assert.equal(q.result.clips[0]!.userLabel, "good take");
+
+    const provider = mockProvider([
+      toolUse("propose_edit_plan", {
+        summary: "Use the good take as the opener.",
+        operations: [{ type: "trim", clipId, inPoint: 0, outPoint: 30 }],
+      }, "tu_plan"),
+      endTurn("Opened on the good take."),
+    ]);
+
+    const r = await runAgent({
+      userPrompt: "use the good take as the opener",
+      session: labeledSession, messages: [], autoApprove: true, confirm: noConfirm(), provider,
+    });
+
+    assert.equal(r.isError, false);
+    assert.equal(clipsInOrder(r.session.state.timeline)[0]!.outPoint, 30);
+    // The label survives the edit (trim keeps it).
+    assert.equal(clipsInOrder(r.session.state.timeline)[0]!.userLabel, "good take");
   });
 });

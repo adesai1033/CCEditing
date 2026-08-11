@@ -70,9 +70,22 @@ export class AnthropicProvider implements ChatProvider {
       messages: request.messages.map(toAnthropicMessage),
       tools: request.tools.map(toAnthropicTool),
       max_tokens: request.maxTokens,
-      // request.reasoning maps to nothing this slice — extended thinking is off.
-      // ── 3E-2.5 fills in here: translate request.reasoning → `thinking`. ──
     };
+
+    // Reasoning: neutral { enabled } → Anthropic adaptive thinking. Adaptive
+    // auto-enables interleaved thinking (reasoning *between* tool calls) with
+    // NO beta header and NO manual budget_tokens (deprecated). `display:
+    // "summarized"` forces the summarized thinking text into the response so the
+    // neutral reasoning block's `text` is populated regardless of the model's
+    // default display (4.6 defaults summarized; newer models default omitted).
+    if (request.reasoning?.enabled) {
+      params.thinking = { type: "adaptive", display: "summarized" };
+      // effort is unset this slice; mapped when present for future callers.
+      // Anthropic reads effort from output_config, not the thinking object.
+      if (request.reasoning.effort) {
+        params.output_config = { effort: request.reasoning.effort };
+      }
+    }
 
     const response = await this.client.messages.create(params);
     return toNeutralResponse(response);
