@@ -14,6 +14,8 @@ interface Props {
   confirmMode?: boolean;
   /** Called when the user presses y or n in confirm mode. */
   onConfirmAnswer?: (approved: boolean) => void;
+  /** When set, a turn is streaming: input is disabled (no typing mid-stream, 3E-4). */
+  disabled?: boolean;
 }
 
 export function InputLine({
@@ -21,11 +23,14 @@ export function InputLine({
   onHistoryUp, onHistoryDown,
   timelineActive, onViewportZoom, onViewportScroll,
   confirmMode = false, onConfirmAnswer,
+  disabled = false,
 }: Props) {
   useInput((input, key) => {
     if (key.ctrl && input === "c") {
       process.exit(0);
     }
+    // During an active turn (not the confirm gate) swallow everything but Ctrl-C.
+    if (disabled && !confirmMode) return;
     if (confirmMode) {
       // y/n only — intercept before anything else, swallow other input.
       if (input === "y" || input === "Y") onConfirmAnswer?.(true);
@@ -48,6 +53,14 @@ export function InputLine({
         <Box borderStyle="single" borderColor="yellow" paddingX={1}>
           <Text bold color="yellow">Apply plan? [y/n]</Text>
         </Box>
+      </Box>
+    );
+  }
+
+  if (disabled) {
+    return (
+      <Box borderStyle="single" borderColor="gray" paddingX={1}>
+        <Text dimColor>› working… (input paused)</Text>
       </Box>
     );
   }

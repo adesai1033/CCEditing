@@ -29,13 +29,20 @@ function makeState(): { state: ProjectState; sourceId: string } {
   return { state, sourceId: state.sources[0]!.id };
 }
 
+// Scouts run in block mode (send); they never stream (decision 5 — their
+// internals are noise). The stream stub asserts that invariant.
+const noStream = () => { throw new Error("scouts must not stream"); };
+
 function mockProvider(responses: ChatResponse[]): ChatProvider {
   let i = 0;
-  return { send: async () => {
-    const r = responses[i++];
-    if (!r) throw new Error(`mockProvider exhausted at ${i}`);
-    return r;
-  } };
+  return {
+    send: async () => {
+      const r = responses[i++];
+      if (!r) throw new Error(`mockProvider exhausted at ${i}`);
+      return r;
+    },
+    stream: noStream,
+  };
 }
 
 function toolUse(name: string, input: unknown, id = "tu"): ChatResponse {
@@ -136,7 +143,7 @@ describe("runScout — degrades to incomplete, never throws", () => {
   test("provider that throws → incomplete, no throw", async () => {
     const { state, sourceId } = makeState();
     const registry = buildPerceptionRegistry();
-    const provider: ChatProvider = { send: async () => { throw new Error("rate limited"); } };
+    const provider: ChatProvider = { send: async () => { throw new Error("rate limited"); }, stream: noStream };
 
     const r = await runScout(sourceId, state, { provider, registry });
     assert.equal(r.incomplete, true);
@@ -149,6 +156,7 @@ describe("runScout — degrades to incomplete, never throws", () => {
     // Always calls a perception tool, never record_findings.
     const provider: ChatProvider = {
       send: async () => toolUse("detect_silence", { sourceId }),
+      stream: noStream,
     };
 
     const r = await runScout(sourceId, state, { provider, registry, budget: 3 });
@@ -170,7 +178,7 @@ describe("runScout — degrades to incomplete, never throws", () => {
   test("unknown source → incomplete without calling the provider", async () => {
     const { state } = makeState();
     let called = false;
-    const provider: ChatProvider = { send: async () => { called = true; return toolUse("x", {}); } };
+    const provider: ChatProvider = { send: async () => { called = true; return toolUse("x", {}); }, stream: noStream };
     const r = await runScout("does-not-exist", state, { provider, registry: buildPerceptionRegistry() });
     assert.equal(r.incomplete, true);
     assert.equal(called, false);

@@ -7,6 +7,8 @@ import type {
   ContentBlock,
   NeutralMessage,
   NeutralStopReason,
+  StreamEvent,
+  StreamHandle,
 } from "./types.js";
 
 /**
@@ -20,6 +22,14 @@ export const MODEL_DEFAULT = "claude-sonnet-4-6";
 const MISSING_KEY_MESSAGE =
   "ANTHROPIC_API_KEY is not set. Export it before running an agent turn (get one at https://console.anthropic.com).";
 
+// A streamed turn from the SDK: async-iterable raw events plus the assembled
+// final message. `client.messages.stream()` returns a MessageStream that
+// satisfies this; tests supply a stand-in.
+export interface AnthropicMessageStreamLike
+  extends AsyncIterable<Anthropic.Messages.RawMessageStreamEvent> {
+  finalMessage(): Promise<Anthropic.Messages.Message>;
+}
+
 // Minimal surface of the Anthropic SDK we use, so tests can inject a mock
 // without constructing a real client. The real client satisfies this trivially.
 export interface AnthropicClientLike {
@@ -27,6 +37,9 @@ export interface AnthropicClientLike {
     create(
       params: Anthropic.Messages.MessageCreateParamsNonStreaming,
     ): Promise<Anthropic.Messages.Message>;
+    stream(
+      params: Anthropic.Messages.MessageStreamParams,
+    ): AnthropicMessageStreamLike;
   };
 }
 
@@ -64,6 +77,50 @@ export class AnthropicProvider implements ChatProvider {
   }
 
   async send(request: ChatRequest): Promise<ChatResponse> {
+    const response = await this.client.messages.create(this.buildParams(request));
+    return toNeutralResponse(response);
+  }
+
+  /**
+   * Stream a turn. Iterates the SDK's raw stream events, translating them to
+   * neutral `StreamEvent`s for display; `finalResponse()` returns the SDK's
+   * ASSEMBLED message mapped through the SAME `toNeutralResponse` as `send()`.
+   * Using the SDK's accumulation (not hand-rolled delta concatenation) is what
+   * keeps thinking `signature` and tool-use input byte-identical, so the
+   * multi-turn round-trip survives streaming (decision 2).
+   */
+  stream(request: ChatRequest): StreamHandle {
+    const sdkStream = this.client.messages.stream(this.buildParams(request));
+    return {
+      async *[Symbol.asyncIterator](): AsyncIterator<StreamEvent> {
+        let stopReason: NeutralStopReason = "other";
+        for await (const ev of sdkStream) {
+          if (ev.type === "content_block_start") {
+            // Surface only that a tool call is forming — never its input JSON.
+            if (ev.content_block.type === "tool_use") {
+              yield { type: "tool_use_start", name: ev.content_block.name };
+            }
+          } else if (ev.type === "content_block_delta") {
+            if (ev.delta.type === "text_delta") {
+              yield { type: "text_delta", text: ev.delta.text };
+            } else if (ev.delta.type === "thinking_delta") {
+              yield { type: "thinking_delta", text: ev.delta.thinking };
+            }
+            // input_json_delta / signature_delta are intentionally not surfaced.
+          } else if (ev.type === "message_delta" && ev.delta.stop_reason) {
+            stopReason = toNeutralStopReason(ev.delta.stop_reason);
+          } else if (ev.type === "message_stop") {
+            yield { type: "message_complete", stopReason };
+          }
+        }
+      },
+      async finalResponse(): Promise<ChatResponse> {
+        return toNeutralResponse(await sdkStream.finalMessage());
+      },
+    };
+  }
+
+  private buildParams(request: ChatRequest): Anthropic.Messages.MessageCreateParamsNonStreaming {
     const params: Anthropic.Messages.MessageCreateParamsNonStreaming = {
       model: this.model,
       system: request.system,
@@ -87,8 +144,7 @@ export class AnthropicProvider implements ChatProvider {
       }
     }
 
-    const response = await this.client.messages.create(params);
-    return toNeutralResponse(response);
+    return params;
   }
 }
 

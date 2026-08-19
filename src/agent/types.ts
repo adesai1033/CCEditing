@@ -28,11 +28,22 @@ export interface ToolSchema {
 }
 
 /**
+ * Optional per-call context the loop passes to a tool's `execute` (3E-4). Lets
+ * a long-running tool surface progress without changing what it returns. Today
+ * only `survey_sources` uses it, to report parallel scout lifecycle; other tools
+ * ignore the argument. Kept minimal — not a general side-channel.
+ */
+export interface ToolContext {
+  onScoutProgress?: (event: { sourceId: string; status: "started" | "completed" | "failed" }) => void;
+}
+
+/**
  * Every tool module exports both an `execute` runtime function and a
  * `schema` describing its inputs. The agent (3E-1) registers all schemas
  * with Claude and dispatches tool calls to the matching execute function.
+ * `ctx` is optional and ignored by tools that don't report progress.
  */
 export interface Tool<I, O> {
-  execute(state: ProjectState, input: I): Promise<ToolResult<O>>;
+  execute(state: ProjectState, input: I, ctx?: ToolContext): Promise<ToolResult<O>>;
   schema: ToolSchema;
 }

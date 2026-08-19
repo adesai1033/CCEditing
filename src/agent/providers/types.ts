@@ -94,13 +94,42 @@ export interface ChatResponse {
   };
 }
 
+// ── Streaming (3E-4) ────────────────────────────────────────────────────────────
+
+/**
+ * Neutral incremental events for DISPLAY only. Vendor SSE deltas never cross the
+ * seam as these — the provider translates. The loop's control flow does not run
+ * on these: it forwards them to the UI, then obtains the SAME complete
+ * `ChatResponse` from `finalResponse()` and proceeds identically to block mode.
+ *
+ * Deliberately excluded: tool-use INPUT JSON. A tool call surfaces only as a
+ * `tool_use_start` indicator (its name); the half-formed input JSON never
+ * reaches the screen (decision 4) — a partial plan must never render.
+ */
+export type StreamEvent =
+  | { type: "text_delta"; text: string }
+  | { type: "thinking_delta"; text: string }
+  | { type: "tool_use_start"; name: string }
+  | { type: "message_complete"; stopReason: NeutralStopReason };
+
+/**
+ * A streamed turn: async-iterate `StreamEvent`s for live display, then await
+ * `finalResponse()` for the assembled `ChatResponse` — byte-identical to what
+ * `send()` returns for the same turn (thinking `signature` and tool-use input
+ * reassembled intact, so the 3E-2.5 round-trip survives streaming).
+ */
+export interface StreamHandle extends AsyncIterable<StreamEvent> {
+  finalResponse(): Promise<ChatResponse>;
+}
+
 // ── The seam ───────────────────────────────────────────────────────────────────
 
 /**
- * The one interface the loop talks to. Minimal on purpose: exactly what
- * `loop.ts` uses today plus the reasoning slot. Streaming, caching, batching,
- * and routing arrive later, through this same seam, in their own slices.
+ * The one interface the loop talks to. `stream()` is the interactive path (3E-4);
+ * `send()` stays for any non-interactive caller. Both resolve the identical
+ * complete `ChatResponse` — streaming changes response CONSUMPTION, not behavior.
  */
 export interface ChatProvider {
   send(request: ChatRequest): Promise<ChatResponse>;
+  stream(request: ChatRequest): StreamHandle;
 }

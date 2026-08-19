@@ -190,3 +190,59 @@ describe("runSurvey — scope", () => {
     assert.equal(r.result.sources[0]!.sourceId, only);
   });
 });
+
+// ── Scout lifecycle events (3E-4) ─────────────────────────────────────────────
+
+describe("runSurvey — scout lifecycle progress", () => {
+  test("emits started then completed per scout, and failed for a failing one", async () => {
+    const state = makeState(3);
+    const ids = state.sources.map((s) => s.id);
+    const failId = ids[1]!;
+
+    const events: Array<{ sourceId: string; status: string }> = [];
+    const deps = {
+      onProgress: (e: { sourceId: string; status: "started" | "completed" | "failed" }) => events.push(e),
+      scout: async (sourceId: string): Promise<ScoutResult> =>
+        sourceId === failId
+          ? { sourceId, contribution: null, incomplete: true, state }
+          : okScout(sourceId, state),
+    };
+
+    const r = await runSurvey(state, {}, deps);
+    assert.ok(r.ok);
+
+    // Every scouted source announced a start.
+    for (const id of ids) {
+      assert.ok(events.some((e) => e.sourceId === id && e.status === "started"), `start for ${id}`);
+    }
+    // The failing source ends "failed"; the others "completed".
+    assert.ok(events.some((e) => e.sourceId === failId && e.status === "failed"));
+    for (const id of ids) {
+      if (id === failId) continue;
+      assert.ok(events.some((e) => e.sourceId === id && e.status === "completed"), `completed for ${id}`);
+    }
+    // started precedes the terminal event for the failing source.
+    const startIdx = events.findIndex((e) => e.sourceId === failId && e.status === "started");
+    const failIdx = events.findIndex((e) => e.sourceId === failId && e.status === "failed");
+    assert.ok(startIdx >= 0 && failIdx > startIdx);
+  });
+
+  test("a cached source emits no scout lifecycle (it isn't scouted)", async () => {
+    let state = makeState(2);
+    const cachedId = state.sources[0]!.id;
+    state = {
+      ...state,
+      sources: state.sources.map((s) =>
+        s.id === cachedId ? { ...s, analyses: { ...s.analyses, scoutContribution: contribution("cached") } } : s,
+      ),
+    };
+    const events: Array<{ sourceId: string; status: string }> = [];
+    const deps = {
+      onProgress: (e: { sourceId: string; status: "started" | "completed" | "failed" }) => events.push(e),
+      scout: async (sourceId: string) => okScout(sourceId, state),
+    };
+
+    await runSurvey(state, {}, deps);
+    assert.ok(!events.some((e) => e.sourceId === cachedId), "cached source is not announced");
+  });
+});

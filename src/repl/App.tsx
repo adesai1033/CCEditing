@@ -9,9 +9,23 @@ import { dispatch, type ReplState } from "./commands/dispatch.js";
 import { renderTimeline, type ViewportState } from "../display/timeline.js";
 import { renderClipList } from "../display/timeline-clip-list.js";
 import { loadOrCreateProject } from "../cli/project-context.js";
-import { clipsInOrder } from "../project/types.js";
+import { clipsInOrder, getClipDisplayRefs } from "../project/types.js";
 import type { PlanForConfirmation } from "../agent/propose_edit_plan.js";
 import type { ProgressEvent } from "../agent/loop.js";
+
+// The ephemeral live view of the turn in flight (3E-4). It shows streamed text
+// and thinking token-by-token, tool indicators, and the parallel scout fan-out.
+// It is never committed piecemeal — at turn end it's cleared and the loop's
+// final output is committed once, so nothing double-renders.
+interface LiveTool { key: string; name: string; done: boolean; ok: boolean; }
+interface LiveScout { sourceId: string; status: "started" | "completed" | "failed"; }
+interface LiveTurn {
+  text: string;
+  thinking: string;
+  tools: LiveTool[];
+  scouts: LiveScout[];
+}
+const EMPTY_TURN: LiveTurn = { text: "", thinking: "", tools: [], scouts: [] };
 
 export function App() {
   const [entries, setEntries]               = useState<HistoryEntry[]>([]);
@@ -26,6 +40,9 @@ export function App() {
   const [pendingEntry, setPendingEntry]     = useState<HistoryEntry | null>(null);
   // Plan awaiting confirmation; presence puts InputLine in confirm mode.
   const [pendingPlan, setPendingPlan]       = useState<PlanForConfirmation | null>(null);
+  // The turn in flight, streamed live; null when idle. `turnActive` disables input.
+  const [liveTurn, setLiveTurn]             = useState<LiveTurn | null>(null);
+  const [turnActive, setTurnActive]         = useState<boolean>(false);
 
   const inputHistoryRef = useRef<string[]>([]);
   // Promise resolver for the agent's `await confirm(plan)`. Set when the agent
@@ -79,49 +96,46 @@ export function App() {
     resolve?.({ approved });
   }
 
+  // Streamed events fold into the ephemeral live view. Nothing here commits to
+  // history — that happens once at turn end (handleSubmit) with the loop's final
+  // output, so streamed text is never double-rendered.
   function handleAgentProgress(event: ProgressEvent): void {
-    // Tool calls render as dim one-liners; assistant text streams through as
-    // soon as it arrives. Errors get a marker.
-    if (event.type === "tool_call") {
-      setEntries((prev) => [...prev, {
-        id: crypto.randomUUID(),
-        input: "",
-        output: `→ ${event.name}(${truncateForProgress(event.input)})`,
-        isError: false,
-        dim: true,
-      }]);
-    } else if (event.type === "tool_result") {
-      const tag = event.ok ? "✓" : "✗";
-      setEntries((prev) => [...prev, {
-        id: crypto.randomUUID(),
-        input: "",
-        output: `${tag} ${event.name} (${event.durationMs}ms)`,
-        isError: !event.ok,
-        dim: true,
-      }]);
-    } else if (event.type === "thinking") {
-      // Dim, distinct from tool-call (→) and assistant text. Only emitted for
-      // non-empty reasoning summaries, so there's no empty container to render.
-      setEntries((prev) => [...prev, {
-        id: crypto.randomUUID(),
-        input: "",
-        output: `✻ thinking… ${event.text}`,
-        isError: false,
-        dim: true,
-      }]);
-    } else if (event.type === "assistant_text") {
-      setEntries((prev) => [...prev, {
-        id: crypto.randomUUID(),
-        input: "",
-        output: event.text,
-        isError: false,
-      }]);
-    }
+    setLiveTurn((prev) => {
+      const t = prev ?? { ...EMPTY_TURN };
+      switch (event.type) {
+        case "text_delta":
+          return { ...t, text: t.text + event.text };
+        case "thinking_delta":
+          return { ...t, thinking: t.thinking + event.text };
+        case "tool_use_start":
+          // A name-only indicator; its input JSON is never surfaced (decision 4).
+          return t;
+        case "tool_call":
+          return { ...t, tools: [...t.tools, { key: crypto.randomUUID(), name: event.name, done: false, ok: true }] };
+        case "tool_result": {
+          // Mark the most recent not-yet-done call of this tool as finished.
+          const tools = [...t.tools];
+          for (let i = tools.length - 1; i >= 0; i--) {
+            if (tools[i]!.name === event.name && !tools[i]!.done) { tools[i] = { ...tools[i]!, done: true, ok: event.ok }; break; }
+          }
+          return { ...t, tools };
+        }
+        case "scout": {
+          const scouts = [...t.scouts];
+          const idx = scouts.findIndex((s) => s.sourceId === event.sourceId);
+          if (idx >= 0) scouts[idx] = { sourceId: event.sourceId, status: event.status };
+          else scouts.push({ sourceId: event.sourceId, status: event.status });
+          return { ...t, scouts };
+        }
+        default:
+          return t;
+      }
+    });
   }
 
   async function handleSubmit(raw: string): Promise<void> {
     const trimmed = raw.trim();
-    if (!trimmed) return;
+    if (!trimmed || turnActive) return;   // no re-entry while a turn streams
 
     inputHistoryRef.current = [trimmed, ...inputHistoryRef.current];
     resetCursor();
@@ -130,6 +144,9 @@ export function App() {
 
     const pendingId = crypto.randomUUID();
     setPendingEntry({ id: pendingId, input: trimmed, output: "Running…", isError: false });
+    // Open the live view for this turn and lock input until it finishes.
+    setLiveTurn({ ...EMPTY_TURN });
+    setTurnActive(true);
 
     const result = await dispatch(trimmed, replState, {
       viewport: viewport ?? undefined,
@@ -137,6 +154,10 @@ export function App() {
       onAgentProgress: handleAgentProgress,
     });
 
+    // Finalize: drop the ephemeral live view and commit the loop's final output
+    // once as static history (streamed text was shown live, not committed).
+    setLiveTurn(null);
+    setTurnActive(false);
     setPendingEntry(null);
     setEntries((prev) => [...prev, {
       id: pendingId,
@@ -148,6 +169,16 @@ export function App() {
     if (result.newState) setReplState(result.newState);
     if (result.activatesTimeline) setTimelineActive(true);
     if (result.shouldExit) setTimeout(() => process.exit(0), 50);
+  }
+
+  // Short label for a scouted source: the display ref of its first clip.
+  function scoutLabel(sourceId: string): string {
+    if (!replState.session) return "?";
+    const refs = getClipDisplayRefs(replState.session.state.timeline);
+    for (const clip of clipsInOrder(replState.session.state.timeline)) {
+      if (clip.sourceId === sourceId) return refs.get(clip.id) ?? "?";
+    }
+    return "?";
   }
 
   // ── Viewport handlers ──────────────────────────────────────────────────────
@@ -200,6 +231,7 @@ export function App() {
     <Box flexDirection="column" height="100%">
       <Header />
       <OutputHistory entries={entries} pendingEntry={pendingEntry} />
+      {liveTurn && <LiveTurnView turn={liveTurn} scoutLabel={scoutLabel} />}
       {pendingPlan && <ConfirmPlan plan={pendingPlan} />}
       {replState.autoApprove && (
         <Box paddingX={1}>
@@ -217,13 +249,36 @@ export function App() {
         onViewportScroll={handleViewportScroll}
         confirmMode={pendingPlan !== null}
         onConfirmAnswer={handleConfirmAnswer}
+        disabled={turnActive}
       />
     </Box>
   );
 }
 
-function truncateForProgress(input: unknown): string {
-  const s = JSON.stringify(input);
-  if (!s) return "";
-  return s.length > 80 ? s.slice(0, 77) + "..." : s;
+// ── Live view of the streaming turn ────────────────────────────────────────────
+
+function LiveTurnView({ turn, scoutLabel }: { turn: LiveTurn; scoutLabel: (id: string) => string }) {
+  const scoutGlyph = (s: LiveScout["status"]) => (s === "completed" ? "✓" : s === "failed" ? "✗" : "…");
+  return (
+    <Box flexDirection="column" paddingX={1}>
+      {/* Parallel fan-out: one row, each source updating independently/out of order. */}
+      {turn.scouts.length > 0 && (
+        <Text dimColor>
+          {"scouting  " + turn.scouts.map((s) => `[${scoutLabel(s.sourceId)}] ${scoutGlyph(s.status)}`).join("  ")}
+        </Text>
+      )}
+      {/* Tool indicators — name only, never streamed input JSON. */}
+      {turn.tools.map((t) => (
+        <Text key={t.key} dimColor>
+          {t.name === "propose_edit_plan"
+            ? `→ preparing plan…${t.done ? " done" : ""}`
+            : `→ ${t.name}${t.done ? (t.ok ? " ✓" : " ✗") : "…"}`}
+        </Text>
+      ))}
+      {/* Thinking summary streams in, dim and distinct. */}
+      {turn.thinking.trim().length > 0 && <Text dimColor>{`✻ thinking… ${turn.thinking}`}</Text>}
+      {/* Assistant prose streams in, normal weight. */}
+      {turn.text.length > 0 && <Text>{turn.text}</Text>}
+    </Box>
+  );
 }

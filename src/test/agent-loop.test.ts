@@ -41,16 +41,36 @@ function makeSession() {
   return { session: createSession(state), clipId: state.timeline.headId! };
 }
 
-// A tiny mock ChatProvider that returns canned NEUTRAL responses, one per call.
-// This is the seam the loop now talks to — no Anthropic SDK shapes here.
+// Build a StreamHandle that synthesizes neutral deltas from a canned response
+// (thinking → thinking_delta, text → text_delta, tool_use → tool_use_start) and
+// resolves that same response from finalResponse(). This is how the loop now
+// consumes a turn; the assembled response drives all behavior identically.
+function handleFor(response: ChatResponse): import("../agent/providers/types.js").StreamHandle {
+  return {
+    async *[Symbol.asyncIterator]() {
+      for (const block of response.content) {
+        if (block.type === "reasoning" && block.text) yield { type: "thinking_delta", text: block.text };
+        else if (block.type === "text") yield { type: "text_delta", text: block.text };
+        else if (block.type === "tool_use") yield { type: "tool_use_start", name: block.name };
+      }
+      yield { type: "message_complete", stopReason: response.stopReason };
+    },
+    async finalResponse() { return response; },
+  };
+}
+
+// A mock ChatProvider that STREAMS canned NEUTRAL responses, one per turn.
+// The seam the loop talks to — no Anthropic SDK shapes here.
 function mockProvider(responses: ChatResponse[]): ChatProvider {
   let i = 0;
+  const next = () => {
+    const r = responses[i++];
+    if (!r) throw new Error(`mockProvider exhausted at call ${i}`);
+    return r;
+  };
   return {
-    send: async () => {
-      const r = responses[i++];
-      if (!r) throw new Error(`mockProvider exhausted at call ${i}`);
-      return r;
-    },
+    send: async () => next(),
+    stream: () => handleFor(next()),
   };
 }
 
@@ -62,14 +82,15 @@ function capturingProvider(responses: ChatResponse[]): {
 } {
   const requests: import("../agent/providers/types.js").ChatRequest[] = [];
   let i = 0;
+  const next = () => {
+    const r = responses[i++];
+    if (!r) throw new Error(`capturingProvider exhausted at call ${i}`);
+    return r;
+  };
   return {
     provider: {
-      send: async (req) => {
-        requests.push(req);
-        const r = responses[i++];
-        if (!r) throw new Error(`capturingProvider exhausted at call ${i}`);
-        return r;
-      },
+      send: async (req) => { requests.push(req); return next(); },
+      stream: (req) => { requests.push(req); return handleFor(next()); },
     },
     requests,
   };
@@ -147,7 +168,7 @@ describe("runAgent — basic flow", () => {
     assert.match(r.output, /one clip/);
     assert.ok(events.includes("tool_call"));
     assert.ok(events.includes("tool_result"));
-    assert.ok(events.includes("assistant_text"));
+    assert.ok(events.includes("text_delta"), "assistant text streams as deltas");
   });
 
   test("multi-turn: second runAgent call sees prior messages", async () => {
@@ -286,8 +307,10 @@ describe("runAgent — error paths", () => {
 
   test("provider error surfaces as friendly output", async () => {
     const { session } = makeSession();
+    // The loop consumes the stream; an error there must surface, not crash.
     const provider: ChatProvider = {
       send: async () => { throw new Error("rate limited"); },
+      stream: () => { throw new Error("rate limited"); },
     };
 
     const r = await runAgent({
@@ -407,7 +430,7 @@ describe("runAgent — extended thinking", () => {
     });
 
     assert.equal(r.isError, false);
-    assert.ok(!events.includes("thinking"), "adaptive skipped thinking → no thinking event");
+    assert.ok(!events.includes("thinking_delta"), "adaptive skipped thinking → no thinking event");
   });
 
   test("a reasoning block with empty text emits no thinking event and does not crash", async () => {
@@ -435,7 +458,7 @@ describe("runAgent — extended thinking", () => {
     });
 
     assert.equal(r.isError, false);
-    assert.ok(!events.includes("thinking"), "empty reasoning text must not emit a thinking event");
+    assert.ok(!events.includes("thinking_delta"), "empty reasoning text must not emit a thinking event");
   });
 
   test("thinking progress is emitted before the tool_call it precedes", async () => {
@@ -464,7 +487,7 @@ describe("runAgent — extended thinking", () => {
     });
 
     assert.equal(r.isError, false);
-    const think = ordered.indexOf("thinking");
+    const think = ordered.indexOf("thinking_delta");
     const call = ordered.indexOf("tool_call");
     assert.ok(think >= 0 && call >= 0, "both events present");
     assert.ok(think < call, "thinking must precede the tool_call");
@@ -822,5 +845,90 @@ describe("runAgent — narrative planning", () => {
     assert.equal(clipsInOrder(r.session.state.timeline)[0]!.outPoint, 30);
     // The label survives the edit (trim keeps it).
     assert.equal(clipsInOrder(r.session.state.timeline)[0]!.userLabel, "good take");
+  });
+});
+
+// ── Streaming (3E-4) ──────────────────────────────────────────────────────────
+//
+// Streaming is a rendering change, not a behavior change: the same tool calls,
+// plans, and writes happen in the same order. These tests assert the deltas
+// reach the progress channel and that a streamed plan still flows through the
+// confirm gate to a single applied undo entry.
+
+describe("runAgent — streaming", () => {
+  test("thinking and text deltas reach the progress channel in order", async () => {
+    const { session } = makeSession();
+    const provider = mockProvider([
+      {
+        content: [
+          { type: "reasoning", provider: "anthropic", opaque: { type: "thinking", thinking: "Let me look.", signature: "s" }, text: "Let me look." },
+          { type: "text", text: "Here is what I found." },
+        ],
+        stopReason: "end_turn",
+        usage: { inputTokens: 0, outputTokens: 0 },
+      },
+    ]);
+
+    const ordered: string[] = [];
+    const r = await runAgent({
+      userPrompt: "hi", session, messages: [], autoApprove: false, confirm: noConfirm(),
+      onProgress: (e) => ordered.push(e.type), provider,
+    });
+
+    assert.equal(r.isError, false);
+    const think = ordered.indexOf("thinking_delta");
+    const text = ordered.indexOf("text_delta");
+    assert.ok(think >= 0 && text >= 0, "both deltas forwarded");
+    assert.ok(think < text, "thinking streams before the answer text");
+    // The final committed output still has the full text (assembled response).
+    assert.match(r.output, /what I found/);
+  });
+
+  test("a tool_use_start indicator is forwarded before the tool is dispatched", async () => {
+    const { session } = makeSession();
+    const provider = mockProvider([
+      toolUse("query_timeline", {}, "tu_qt"),
+      endTurn("One clip."),
+    ]);
+
+    const ordered: string[] = [];
+    await runAgent({
+      userPrompt: "what's here?", session, messages: [], autoApprove: false, confirm: noConfirm(),
+      onProgress: (e) => ordered.push(e.type), provider,
+    });
+
+    const start = ordered.indexOf("tool_use_start");
+    const call = ordered.indexOf("tool_call");
+    assert.ok(start >= 0 && call >= 0 && start < call, "tool_use_start precedes tool_call dispatch");
+  });
+
+  test("stream → confirm → resume: a streamed plan applies as one undo entry after approval", async () => {
+    const { session, clipId } = makeSession();
+    const provider = mockProvider([
+      toolUse("propose_edit_plan", {
+        summary: "Trim.",
+        operations: [{ type: "trim", clipId, inPoint: 0, outPoint: 30 }],
+      }, "tu_plan"),
+      endTurn("Applied the trim."),   // the resumed turn streams after approval
+    ]);
+
+    let confirmCalls = 0;
+    const events: string[] = [];
+    const r = await runAgent({
+      userPrompt: "trim to 30s",
+      session,
+      messages: [],
+      autoApprove: false,                       // force the confirm gate
+      confirm: async () => { confirmCalls++; return { approved: true }; },
+      onProgress: (e) => events.push(e.type),
+      provider,
+    });
+
+    assert.equal(r.isError, false);
+    assert.equal(confirmCalls, 1, "the confirm gate fired once, between turns");
+    assert.equal(clipsInOrder(r.session.state.timeline)[0]!.outPoint, 30);
+    assert.equal(r.session.undo.length, 1, "one undo entry for the applied plan");
+    // The resumed turn streamed its text.
+    assert.ok(events.filter((e) => e === "text_delta").length >= 1, "the post-approval turn streamed");
   });
 });

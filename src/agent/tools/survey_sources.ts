@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { ProjectState, SourceAnalyses } from "../../project/types.js";
 import { clipsInOrder } from "../../project/types.js";
-import type { ToolResult, ToolSchema } from "../types.js";
+import type { ToolContext, ToolResult, ToolSchema } from "../types.js";
 import { buildDefaultProvider } from "../providers/default.js";
 import { buildPerceptionRegistry } from "../perception-registry.js";
 import { runScout, type ScoutResult } from "../scout.js";
@@ -32,12 +32,15 @@ const SurveyInputSchema = z.object({
   sourceIds: z.array(z.string()).optional(),
 });
 
+export type ScoutLifecycle = { sourceId: string; status: "started" | "completed" | "failed" };
+
 export interface SurveyDeps {
   // Injected for tests; production wraps runScout with the default provider +
   // perception registry.
   scout: (sourceId: string, state: ProjectState) => Promise<ScoutResult>;
   concurrency?: number;
-  onProgress?: (event: { type: "scouting"; sourceId: string }) => void;
+  // Per-scout lifecycle for the REPL's parallel fan-out display (3E-4).
+  onProgress?: (event: ScoutLifecycle) => void;
 }
 
 /**
@@ -62,9 +65,11 @@ export async function runSurvey(
   }
 
   const concurrency = deps.concurrency ?? SURVEY_CONCURRENCY;
-  const scoutResults = await mapWithConcurrency(toScout, concurrency, (id) => {
-    deps.onProgress?.({ type: "scouting", sourceId: id });
-    return deps.scout(id, state);
+  const scoutResults = await mapWithConcurrency(toScout, concurrency, async (id) => {
+    deps.onProgress?.({ sourceId: id, status: "started" });
+    const r = await deps.scout(id, state);
+    deps.onProgress?.({ sourceId: id, status: r.incomplete ? "failed" : "completed" });
+    return r;
   });
 
   // Merge each scout's per-source analyses back into the base state. Scouts ran
@@ -134,10 +139,11 @@ async function mapWithConcurrency<T, R>(items: T[], limit: number, fn: (item: T)
 
 // ── Registered director-facing tool ───────────────────────────────────────────
 
-async function execute(state: ProjectState, input: unknown): Promise<ToolResult<ContentMap>> {
+async function execute(state: ProjectState, input: unknown, ctx?: ToolContext): Promise<ToolResult<ContentMap>> {
   const parsed = SurveyInputSchema.safeParse(input ?? {});
   const sourceIds = parsed.success ? parsed.data.sourceIds : undefined;
-  return runSurvey(state, { sourceIds }, defaultDeps());
+  // Forward per-scout lifecycle to the loop's progress channel (3E-4).
+  return runSurvey(state, { sourceIds }, { ...defaultDeps(), onProgress: ctx?.onScoutProgress });
 }
 
 function defaultDeps(): SurveyDeps {

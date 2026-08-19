@@ -23,6 +23,7 @@ function capturingClient(response: Anthropic.Messages.Message): {
           captured = params;
           return response;
         },
+        stream: () => { throw new Error("stream not used in this test"); },
       },
     },
     lastParams: () => {
@@ -31,6 +32,41 @@ function capturingClient(response: Anthropic.Messages.Message): {
     },
   };
 }
+
+// A client whose messages.stream() yields canned raw SSE events and resolves a
+// canned assembled final message — the two halves the provider must reconcile.
+function streamingClient(rawEvents: unknown[], finalMsg: Anthropic.Messages.Message): {
+  client: AnthropicClientLike;
+  lastParams: () => Anthropic.Messages.MessageStreamParams;
+} {
+  let captured: Anthropic.Messages.MessageStreamParams | undefined;
+  return {
+    client: {
+      messages: {
+        create: async () => { throw new Error("create not used in this test"); },
+        stream: (params) => {
+          captured = params;
+          return {
+            async *[Symbol.asyncIterator]() {
+              for (const ev of rawEvents) yield ev as Anthropic.Messages.RawMessageStreamEvent;
+            },
+            async finalMessage() { return finalMsg; },
+          };
+        },
+      },
+    },
+    lastParams: () => {
+      if (!captured) throw new Error("stream was never called");
+      return captured;
+    },
+  };
+}
+
+// Raw SSE event fixtures (loosely typed — the provider only reads a few fields).
+function evTextDelta(text: string): unknown { return { type: "content_block_delta", index: 0, delta: { type: "text_delta", text } }; }
+function evThinkingDelta(thinking: string): unknown { return { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking } }; }
+function evToolStart(name: string): unknown { return { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "tu", name, input: {} } }; }
+function evStop(stopReason: string): unknown[] { return [{ type: "message_delta", delta: { stop_reason: stopReason }, usage: {} }, { type: "message_stop" }]; }
 
 function anthropicMessage(
   content: unknown[],
@@ -309,5 +345,83 @@ describe("AnthropicProvider — key handling", () => {
     } finally {
       if (saved !== undefined) process.env["ANTHROPIC_API_KEY"] = saved;
     }
+  });
+});
+
+// ── Streaming (3E-4) ──────────────────────────────────────────────────────────
+
+describe("AnthropicProvider — stream()", () => {
+  test("translates raw SSE events into neutral StreamEvents in order", async () => {
+    const raw = [
+      evThinkingDelta("Let me "), evThinkingDelta("think."),
+      evTextDelta("Here "), evTextDelta("goes."),
+      evToolStart("query_timeline"),
+      ...evStop("tool_use"),
+    ];
+    const finalMsg = anthropicMessage([{ type: "text", text: "Here goes.", citations: null }], "tool_use");
+    const { client } = streamingClient(raw, finalMsg);
+    const provider = new AnthropicProvider({ model: MODEL_DEFAULT, client });
+
+    const events: unknown[] = [];
+    const handle = provider.stream(baseRequest([]));
+    for await (const ev of handle) events.push(ev);
+
+    assert.deepEqual(events, [
+      { type: "thinking_delta", text: "Let me " },
+      { type: "thinking_delta", text: "think." },
+      { type: "text_delta", text: "Here " },
+      { type: "text_delta", text: "goes." },
+      { type: "tool_use_start", name: "query_timeline" },
+      { type: "message_complete", stopReason: "tool_use" },
+    ]);
+    // Tool-use INPUT JSON is never surfaced as a stream event (decision 4).
+    assert.ok(!events.some((e) => JSON.stringify(e).includes("input_json")));
+  });
+
+  test("the assembled final response is identical to block mode — thinking signature intact, round-trip survives", async () => {
+    const thinkingBlock = { type: "thinking", thinking: "Plan it out.", signature: "sig-stream-xyz==" };
+    // The final message carries a thinking block + a fully-assembled tool_use.
+    const finalMsg = anthropicMessage(
+      [thinkingBlock, { type: "tool_use", id: "tu_1", name: "query_timeline", input: { a: 1 } }],
+      "tool_use",
+    );
+    const raw = [evThinkingDelta("Plan it out."), evToolStart("query_timeline"), ...evStop("tool_use")];
+    const { client } = streamingClient(raw, finalMsg);
+    const provider = new AnthropicProvider({ model: MODEL_DEFAULT, client });
+
+    // Drain the stream, then take the assembled response.
+    const handle = provider.stream(baseRequest([]));
+    for await (const _ of handle) { /* consume */ }
+    const res = await handle.finalResponse();
+
+    // Same neutral shape send() would produce: reasoning block opaque intact + tool_use.
+    const reasoning = res.content[0] as any;
+    assert.equal(reasoning.type, "reasoning");
+    assert.deepEqual(reasoning.opaque, thinkingBlock);
+    assert.deepEqual(res.content[1], { type: "tool_use", id: "tu_1", name: "query_timeline", input: { a: 1 } });
+    assert.equal(res.stopReason, "tool_use");
+
+    // Feed the streamed reasoning block back through a request → byte-identical
+    // thinking block, signature untouched (the 3E-2.5 round-trip survives streaming).
+    const { client: c2, lastParams } = capturingClient(anthropicMessage([{ type: "text", text: "ok", citations: null }], "end_turn"));
+    const provider2 = new AnthropicProvider({ model: MODEL_DEFAULT, client: c2 });
+    await provider2.send(baseRequest([{ role: "assistant", content: [reasoning] }]));
+    assert.deepEqual((lastParams().messages[0]?.content as any[])[0], thinkingBlock);
+  });
+
+  test("a streamed turn with no thinking block assembles cleanly", async () => {
+    const finalMsg = anthropicMessage([{ type: "text", text: "Just text.", citations: null }], "end_turn");
+    const { client } = streamingClient([evTextDelta("Just text."), ...evStop("end_turn")], finalMsg);
+    const provider = new AnthropicProvider({ model: MODEL_DEFAULT, client });
+
+    const handle = provider.stream(baseRequest([]));
+    const seen: string[] = [];
+    for await (const ev of handle) seen.push(ev.type);
+    const res = await handle.finalResponse();
+
+    assert.ok(!seen.includes("thinking_delta"), "no thinking streamed");
+    assert.ok(!res.content.some((b) => b.type === "reasoning"), "no reasoning block assembled");
+    assert.deepEqual(res.content[0], { type: "text", text: "Just text." });
+    assert.equal(res.stopReason, "end_turn");
   });
 });

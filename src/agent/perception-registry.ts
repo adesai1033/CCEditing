@@ -1,5 +1,5 @@
 import type { ProjectState } from "../project/types.js";
-import type { ToolResult, ToolSchema } from "./types.js";
+import type { ToolContext, ToolResult, ToolSchema } from "./types.js";
 
 import { queryTimeline } from "./tools/query_timeline.js";
 import { describeClip } from "./tools/describe_clip.js";
@@ -19,7 +19,7 @@ import { detectSilence } from "./tools/detect_silence.js";
  * a ToolResult. propose_edit_plan is NOT dispatched here; it's handled
  * specially by the loop because it requires confirmation.
  */
-export type ToolExecute = (state: ProjectState, input: unknown) => Promise<ToolResult<unknown>>;
+export type ToolExecute = (state: ProjectState, input: unknown, ctx?: ToolContext) => Promise<ToolResult<unknown>>;
 
 export interface ToolEntry {
   schema: ToolSchema;
@@ -48,12 +48,12 @@ export class ToolRegistry {
   private readonly terminals: ToolSchema[] = [];
 
   /** Register a read-only perception tool (scout-safe). */
-  register<I, O>(tool: { schema: ToolSchema; execute: (state: ProjectState, input: I) => Promise<ToolResult<O>> }): void {
+  register<I, O>(tool: { schema: ToolSchema; execute: (state: ProjectState, input: I, ctx?: ToolContext) => Promise<ToolResult<O>> }): void {
     this.perception.set(tool.schema.name, { schema: tool.schema, execute: tool.execute as ToolExecute });
   }
 
   /** Register a director-only dispatchable tool (e.g. survey_sources). */
-  registerDirectorTool<I, O>(tool: { schema: ToolSchema; execute: (state: ProjectState, input: I) => Promise<ToolResult<O>> }): void {
+  registerDirectorTool<I, O>(tool: { schema: ToolSchema; execute: (state: ProjectState, input: I, ctx?: ToolContext) => Promise<ToolResult<O>> }): void {
     this.director.set(tool.schema.name, { schema: tool.schema, execute: tool.execute as ToolExecute });
   }
 

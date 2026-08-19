@@ -31,8 +31,13 @@ type ToolResultBlock = Extract<ContentBlock, { type: "tool_result" }>;
 export type ProgressEvent =
   | { type: "tool_call"; name: string; input: unknown }
   | { type: "tool_result"; name: string; ok: boolean; durationMs: number }
-  | { type: "assistant_text"; text: string }
-  | { type: "thinking"; text: string };
+  // Streamed incremental display (3E-4). text/thinking arrive token-by-token;
+  // tool_use_start indicates a tool call is forming (name only, never its JSON);
+  // scout reports parallel fan-out lifecycle from survey_sources.
+  | { type: "text_delta"; text: string }
+  | { type: "thinking_delta"; text: string }
+  | { type: "tool_use_start"; name: string }
+  | { type: "scout"; sourceId: string; status: "started" | "completed" | "failed" };
 
 export interface AgentInput {
   userPrompt: string;
@@ -94,9 +99,13 @@ export async function runAgent(input: AgentInput): Promise<AgentResult> {
   const tools = registry.allSchemas();
 
   for (let i = 0; i < MAX_TOOL_CALLS_PER_TURN + 1; i++) {
+    // Stream the turn for live display, then take the SAME complete response the
+    // block path would return and proceed identically (decisions 1 & 3). Text
+    // and thinking render token-by-token via deltas; tool calls surface as a
+    // name-only indicator — never streamed input JSON.
     let response: ChatResponse;
     try {
-      response = await provider.send({
+      const streaming = provider.stream({
         system,
         messages: state.messages,
         tools,
@@ -106,6 +115,14 @@ export async function runAgent(input: AgentInput): Promise<AgentResult> {
         // simple edits). No Anthropic-specific handling reaches this file.
         reasoning: { enabled: true },
       });
+      for await (const ev of streaming) {
+        if (ev.type === "text_delta") input.onProgress?.({ type: "text_delta", text: ev.text });
+        else if (ev.type === "thinking_delta") input.onProgress?.({ type: "thinking_delta", text: ev.text });
+        else if (ev.type === "tool_use_start") input.onProgress?.({ type: "tool_use_start", name: ev.name });
+        // message_complete carries nothing the loop needs; stop reason comes
+        // from the assembled response below.
+      }
+      response = await streaming.finalResponse();
     } catch (err: unknown) {
       return finalize(state, `Agent error: ${(err as Error).message}`, true);
     }
@@ -122,18 +139,12 @@ export async function runAgent(input: AgentInput): Promise<AgentResult> {
       ],
     };
 
-    // Surface blocks via progress in content order (so interleaved reasoning
-    // renders before the tool_call it precedes). Text blocks are also
-    // remembered for the final summary; reasoning blocks are carried in history
-    // but only surfaced as dim thinking progress, never as answer text. In
-    // adaptive mode a turn may contain zero reasoning blocks — do not assume one.
+    // Accumulate assistant text for the final summary. The text was already
+    // shown live via text_delta events during streaming, so we do NOT re-emit a
+    // completed block event here (that would double-render). Reasoning blocks
+    // are carried in history but only surfaced as streamed thinking.
     for (const block of response.content) {
-      if (block.type === "text") {
-        state.assistantText.push(block.text);
-        input.onProgress?.({ type: "assistant_text", text: block.text });
-      } else if (block.type === "reasoning" && block.text && block.text.trim().length > 0) {
-        input.onProgress?.({ type: "thinking", text: block.text });
-      }
+      if (block.type === "text") state.assistantText.push(block.text);
     }
 
     if (response.stopReason === "max_output") {
@@ -234,9 +245,16 @@ async function dispatchToolUse(
     };
   }
 
+  // Forward any per-scout lifecycle the tool reports (survey_sources) to the
+  // progress channel so the REPL can render the parallel fan-out.
+  const ctx = {
+    onScoutProgress: (e: { sourceId: string; status: "started" | "completed" | "failed" }) =>
+      input.onProgress?.({ type: "scout", sourceId: e.sourceId, status: e.status }),
+  };
+
   let outcome;
   try {
-    outcome = await entry.execute(state.session.state, tu.input);
+    outcome = await entry.execute(state.session.state, tu.input, ctx);
   } catch (err: unknown) {
     input.onProgress?.({ type: "tool_result", name: tu.name, ok: false, durationMs: Date.now() - start });
     return {
