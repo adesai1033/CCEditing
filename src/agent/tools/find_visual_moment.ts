@@ -1,6 +1,7 @@
 import type { ProjectState, SourceFile } from "../../project/types.js";
 import type { Tool, ToolSchema, ToolResult } from "../types.js";
 import { realBackend as defaultBackend, type TwelveLabsBackend } from "../backends/twelvelabs.js";
+import { getDefaultIndexRegistry, type IndexRegistry } from "../indexing.js";
 
 export interface FindVisualMomentInput {
   sourceId: string;
@@ -20,6 +21,7 @@ export async function executeFindVisualMoment(
   state: ProjectState,
   input: FindVisualMomentInput,
   backend: TwelveLabsBackend = defaultBackend,
+  registry: IndexRegistry = getDefaultIndexRegistry(),
 ): Promise<ToolResult<FindVisualMomentOutput>> {
   const source = state.sources.find((s) => s.id === input.sourceId);
   if (!source) return { ok: false, error: `Source not found: ${input.sourceId}` };
@@ -30,13 +32,20 @@ export async function executeFindVisualMoment(
     return { ok: true, result: { hits: cached.hits } };
   }
 
-  // Auto-index if not yet indexed
+  // Index if not yet indexed — through the registry (3E-6), never directly:
+  // if /open already started the job in the background, this AWAITS the
+  // in-flight work instead of starting a second index; if nothing started it,
+  // this preserves the pre-slice lazy behavior. The result is persisted here
+  // via stateUpdate, as before.
   let updatedSource = source;
   let stateUpdate: ProjectState | undefined;
 
   if (!source.analyses.twelveLabs || source.analyses.twelveLabs.status !== "indexed") {
     try {
-      const { indexId, videoId } = await backend.indexVideo(source.filePath);
+      const { indexId, videoId } = await registry.ensure(
+        { id: source.id, filePath: source.filePath },
+        () => backend.indexVideo(source.filePath),
+      );
       updatedSource = {
         ...source,
         analyses: {
@@ -97,7 +106,8 @@ const schema: ToolSchema = {
     "description. Returns timestamp ranges (seconds) with confidence scores. " +
     "Use this to locate specific events ('the car crossing the finish line', " +
     "'the summit shot') so you can trim or split around them. " +
-    "First call against a source triggers cloud indexing and may take 30s-2min; " +
+    "Cloud indexing usually starts in the background when a file is opened; " +
+    "the first call may wait for it to finish (30s-2min if it just started); " +
     "subsequent calls are fast.",
   input_schema: {
     type: "object",

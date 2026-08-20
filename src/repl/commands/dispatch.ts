@@ -16,6 +16,8 @@ import {
   type ProjectSession,
 } from "../../project/session.js";
 import { setClipUserLabel, clearClipUserLabel } from "../../project/mutations.js";
+import { getDefaultIndexRegistry } from "../../agent/indexing.js";
+import chalk from "chalk";
 import { loadOrCreateProject, saveProjectToStandardPath } from "../../cli/project-context.js";
 import { parseTime } from "../../utils/time.js";
 import { execute } from "../../engine/engine.js";
@@ -156,9 +158,22 @@ async function dispatchOpen(args: string[], state: ReplState): Promise<DispatchR
   const saved = await saveProjectToStandardPath(result.session);
   if (!saved.ok) return { output: `Error saving project: ${saved.error}`, isError: true };
 
+  // Kick off TwelveLabs indexing in the background (3E-6): fire-and-forget,
+  // never blocking — /open returns as fast as it did before, and by the time
+  // the user asks for visual perception the index is often ready. The registry
+  // dedupes and captures failures; a failure surfaces only when a tool needs
+  // the index. Skipped without a key (the lazy tool-time error still applies)
+  // or when the source is already indexed from a prior session.
+  const newSource = result.session.state.sources[result.session.state.sources.length - 1]!;
+  let indexNote = "";
+  if (process.env["TWELVELABS_API_KEY"] && newSource.analyses.twelveLabs?.status !== "indexed") {
+    getDefaultIndexRegistry().start({ id: newSource.id, filePath: newSource.filePath });
+    indexNote = "\n" + chalk.dim("⟳ visual indexing started in background");
+  }
+
   const clipCount = clipsInOrder(result.session.state.timeline).length;
   return {
-    output: renderMediaInfo(probe.data) + `\n\nAdded to project  ·  ${clipCount} clip${clipCount === 1 ? "" : "s"}`,
+    output: renderMediaInfo(probe.data) + `\n\nAdded to project  ·  ${clipCount} clip${clipCount === 1 ? "" : "s"}` + indexNote,
     isError: false,
     newState: { ...state, session: result.session },
   };

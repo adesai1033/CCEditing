@@ -54,6 +54,7 @@ describe("architecture guard", () => {
       join(AGENT_DIR, "scout.ts"),
       join(AGENT_DIR, "content-map.ts"),
       join(AGENT_DIR, "perception-registry.ts"),
+      join(AGENT_DIR, "indexing.ts"),
       join(AGENT_DIR, "tools", "survey_sources.ts"),
     ];
     const offenders: string[] = [];
