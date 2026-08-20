@@ -15,7 +15,7 @@ import {
   renderPlanForConfirmation,
   type PlanForConfirmation,
 } from "./propose_edit_plan.js";
-import { runCritic, type CriticInput, type CriticVerdict } from "./critic.js";
+import { runCritic, type CriticConcern, type CriticInput, type CriticVerdict } from "./critic.js";
 import type { ContentMap } from "./content-map.js";
 
 const MAX_TOOL_CALLS_PER_TURN = 25;
@@ -42,7 +42,9 @@ type ToolResultBlock = Extract<ContentBlock, { type: "tool_result" }>;
 
 export type ProgressEvent =
   | { type: "tool_call"; name: string; input: unknown }
-  | { type: "tool_result"; name: string; ok: boolean; durationMs: number }
+  // `detail` (3K) carries the tool's result payload (or error text) so the
+  // REPL can retain it for Ctrl+R expansion. Display channel only.
+  | { type: "tool_result"; name: string; ok: boolean; durationMs: number; detail?: unknown }
   // Streamed incremental display (3E-4). text/thinking arrive token-by-token;
   // tool_use_start indicates a tool call is forming (name only, never its JSON);
   // scout reports parallel fan-out lifecycle from survey_sources.
@@ -53,7 +55,9 @@ export type ProgressEvent =
   // Critic pass lifecycle (3G): start when a drafted plan goes to review,
   // verdict when it comes back. The REPL renders these as a dim line.
   | { type: "critic_start" }
-  | { type: "critic_verdict"; verdict: "approve" | "revise"; concerns: number };
+  // `concernDetails` (3K): the structured concerns themselves, for expansion —
+  // seeing WHY the critic revised is the most useful thing Ctrl+R unlocks.
+  | { type: "critic_verdict"; verdict: "approve" | "revise"; concerns: number; concernDetails?: CriticConcern[] };
 
 export interface AgentInput {
   userPrompt: string;
@@ -154,6 +158,7 @@ export async function runAgent(input: AgentInput): Promise<AgentResult> {
         // model decides per turn whether/how much to think (adaptive skips it on
         // simple edits). No Anthropic-specific handling reaches this file.
         reasoning: { enabled: true },
+        role: "director",
       });
       for await (const ev of streaming) {
         if (ev.type === "text_delta") input.onProgress?.({ type: "text_delta", text: ev.text });
@@ -278,7 +283,7 @@ async function dispatchToolUse(
   const entry = registry.get(tu.name);
   if (!entry) {
     const errText = `Unknown tool: ${tu.name}`;
-    input.onProgress?.({ type: "tool_result", name: tu.name, ok: false, durationMs: Date.now() - start });
+    input.onProgress?.({ type: "tool_result", name: tu.name, ok: false, durationMs: Date.now() - start, detail: errText });
     return {
       state,
       result: { type: "tool_result", toolUseId: tu.id, content: errText, isError: true },
@@ -297,7 +302,7 @@ async function dispatchToolUse(
   try {
     outcome = await entry.execute(state.session.state, tu.input, ctx);
   } catch (err: unknown) {
-    input.onProgress?.({ type: "tool_result", name: tu.name, ok: false, durationMs: Date.now() - start });
+    input.onProgress?.({ type: "tool_result", name: tu.name, ok: false, durationMs: Date.now() - start, detail: `Tool threw: ${(err as Error).message}` });
     return {
       state,
       result: {
@@ -311,7 +316,7 @@ async function dispatchToolUse(
   }
 
   if (!outcome.ok) {
-    input.onProgress?.({ type: "tool_result", name: tu.name, ok: false, durationMs: Date.now() - start });
+    input.onProgress?.({ type: "tool_result", name: tu.name, ok: false, durationMs: Date.now() - start, detail: outcome.error });
     return {
       state,
       result: { type: "tool_result", toolUseId: tu.id, content: outcome.error, isError: true },
@@ -327,7 +332,7 @@ async function dispatchToolUse(
     nextSession = { ...state.session, state: outcome.stateUpdate };
   }
 
-  input.onProgress?.({ type: "tool_result", name: tu.name, ok: true, durationMs: Date.now() - start });
+  input.onProgress?.({ type: "tool_result", name: tu.name, ok: true, durationMs: Date.now() - start, detail: outcome.result });
 
   // 3G: remember that this turn surveyed, and hold the map for the critic —
   // the critic sees the same distilled substrate the director planned against.
@@ -358,7 +363,7 @@ async function handleProposePlan(
 ): Promise<ToolHandled> {
   const parsed = ProposeEditPlanInputSchema.safeParse(tu.input);
   if (!parsed.success) {
-    input.onProgress?.({ type: "tool_result", name: tu.name, ok: false, durationMs: Date.now() - startMs });
+    input.onProgress?.({ type: "tool_result", name: tu.name, ok: false, durationMs: Date.now() - startMs, detail: `Plan input failed validation: ${parsed.error.message}` });
     return {
       state,
       result: {
@@ -376,7 +381,7 @@ async function handleProposePlan(
   for (const op of parsed.data.operations) {
     const r = AgentOperationSchema.safeParse(op);
     if (!r.success) {
-      input.onProgress?.({ type: "tool_result", name: tu.name, ok: false, durationMs: Date.now() - startMs });
+      input.onProgress?.({ type: "tool_result", name: tu.name, ok: false, durationMs: Date.now() - startMs, detail: `Operation failed validation: ${r.error.message}` });
       return {
         state,
         result: {
@@ -414,13 +419,13 @@ async function handleProposePlan(
       // critic failure must never strand a valid plan.
       review = { verdict: "approve", concerns: [] };
     }
-    input.onProgress?.({ type: "critic_verdict", verdict: review.verdict, concerns: review.concerns.length });
+    input.onProgress?.({ type: "critic_verdict", verdict: review.verdict, concerns: review.concerns.length, concernDetails: review.concerns });
 
     if (review.verdict === "revise") {
       // A revision round needs budget for the director's re-proposal; if the
       // cap or the budget is exhausted, stop revising and present instead.
       if (state.criticRevisions < MAX_CRITIC_REVISIONS && state.toolBudget > 0) {
-        input.onProgress?.({ type: "tool_result", name: tu.name, ok: true, durationMs: Date.now() - startMs });
+        input.onProgress?.({ type: "tool_result", name: tu.name, ok: true, durationMs: Date.now() - startMs, detail: { status: "revise", concerns: review.concerns } });
         return {
           state: { ...state, criticRevisions: state.criticRevisions + 1 },
           result: {
@@ -452,7 +457,7 @@ async function handleProposePlan(
   }
 
   if (!approved) {
-    input.onProgress?.({ type: "tool_result", name: tu.name, ok: true, durationMs: Date.now() - startMs });
+    input.onProgress?.({ type: "tool_result", name: tu.name, ok: true, durationMs: Date.now() - startMs, detail: { status: "rejected" } });
     return {
       state: { ...state, rejected: true },
       result: {
@@ -469,7 +474,7 @@ async function handleProposePlan(
   const applyResult = applyPlan(state.session, userPrompt, plan.operations);
 
   if (!applyResult.ok) {
-    input.onProgress?.({ type: "tool_result", name: tu.name, ok: false, durationMs: Date.now() - startMs });
+    input.onProgress?.({ type: "tool_result", name: tu.name, ok: false, durationMs: Date.now() - startMs, detail: { status: "failed", failedAt: applyResult.failedAt, error: applyResult.error } });
     return {
       state: {
         ...state,
@@ -489,7 +494,7 @@ async function handleProposePlan(
     };
   }
 
-  input.onProgress?.({ type: "tool_result", name: tu.name, ok: true, durationMs: Date.now() - startMs });
+  input.onProgress?.({ type: "tool_result", name: tu.name, ok: true, durationMs: Date.now() - startMs, detail: { status: "applied", summary: plan.summary, opsCount: plan.operations.length } });
   return {
     state: {
       ...state,

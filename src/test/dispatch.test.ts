@@ -630,3 +630,94 @@ describe("/critic", () => {
     assert.match(r.output, /\/critic \[on\|off\]/);
   });
 });
+
+// ── /preview (3H) ─────────────────────────────────────────────────────────────
+
+describe("/preview", () => {
+  const mockedPreviewDeps = () => {
+    const rendered: unknown[][] = [];
+    return {
+      rendered,
+      deps: {
+        render: async (segments: unknown[]) => {
+          rendered.push(segments);
+          return { ok: true as const, path: "/tmp/preview-x.mp4", cachedSegments: 0, renderedSegments: segments.length };
+        },
+        open: async () => ({ launched: true }),
+      },
+    };
+  };
+
+  test("returns error when no project", async () => {
+    const r = await dispatch("/preview", noProject);
+    assert.equal(r.isError, true);
+    assert.match(r.output, /No project open/);
+  });
+
+  test("empty timeline → friendly message, no render", async () => {
+    const { rendered, deps } = mockedPreviewDeps();
+    const r = await dispatch("/preview", { session: createSession(createProject("test")), messages: [], autoApprove: false }, { previewDeps: deps });
+    assert.equal(r.isError, true);
+    assert.match(r.output, /No clips/);
+    assert.equal(rendered.length, 0);
+  });
+
+  test("all three forms dispatch: whole timeline, one clip, a range", async () => {
+    const { rendered, deps } = mockedPreviewDeps();
+    const state = makeState(2);
+
+    const whole = await dispatch("/preview", state, { previewDeps: deps });
+    assert.equal(whole.isError, false);
+    assert.match(whole.output, /system player/);
+
+    const clip = await dispatch("/preview 2", state, { previewDeps: deps });
+    assert.equal(clip.isError, false);
+
+    const range = await dispatch("/preview 0:05 15", state, { previewDeps: deps });
+    assert.equal(range.isError, false);
+
+    assert.equal(rendered.length, 3);
+    assert.equal((rendered[0] as unknown[]).length, 2, "whole timeline → both clips");
+    assert.equal((rendered[1] as unknown[]).length, 1, "clip scope → one segment");
+  });
+
+  test("invalid clip ref, inverted range, and extra args error cleanly", async () => {
+    const { deps } = mockedPreviewDeps();
+    const state = makeState(1);
+
+    const badRef = await dispatch("/preview 99", state, { previewDeps: deps });
+    assert.equal(badRef.isError, true);
+    assert.match(badRef.output, /not found/);
+
+    const inverted = await dispatch("/preview 20 10", state, { previewDeps: deps });
+    assert.equal(inverted.isError, true);
+
+    const extra = await dispatch("/preview 1 2 3", state, { previewDeps: deps });
+    assert.equal(extra.isError, true);
+    assert.match(extra.output, /Usage/);
+  });
+
+  test("read-only: no newState, no synthetic continuity message", async () => {
+    const { deps } = mockedPreviewDeps();
+    const r = await dispatch("/preview", makeState(1), { previewDeps: deps });
+    assert.equal(r.isError, false);
+    assert.equal(r.newState, undefined, "preview must not produce a state change");
+  });
+
+  test("a cancelled render reports as non-error output", async () => {
+    const state = makeState(1);
+    const r = await dispatch("/preview", state, {
+      previewDeps: {
+        render: async () => ({ ok: false as const, code: "ABORTED" as const, error: "cancelled" }),
+        open: async () => ({ launched: true }),
+      },
+    });
+    assert.equal(r.isError, false, "user cancellation is not an error");
+    assert.match(r.output, /cancelled/i);
+  });
+
+  test("/help lists /preview", async () => {
+    const r = await dispatch("/help", noProject);
+    assert.match(r.output, /\/preview \[clip \| start end\]/);
+  });
+});

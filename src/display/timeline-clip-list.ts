@@ -1,6 +1,6 @@
-import chalk from "chalk";
 import type { ProjectState } from "../project/types.js";
 import { clipsInOrder, getClipDisplayRefs } from "../project/types.js";
+import { paint, glyphs } from "../ui/theme.js";
 
 function formatDuration(seconds: number): string {
   const h = Math.floor(seconds / 3600);
@@ -21,25 +21,35 @@ function formatSeconds(seconds: number): string {
   return parts.join("");
 }
 
-/** Renders a numbered list of clips with in/out points and duration. */
+/**
+ * A numbered list of clips with in/out points and duration. Columns are sized
+ * from the content (ref width, name width) so a run of rows scans vertically;
+ * user labels (3E-3 /label) trail as a distinct chip.
+ */
 export function renderClipList(state: ProjectState): string {
   const ordered = clipsInOrder(state.timeline);
   if (ordered.length === 0) return "";
 
-  const sourceMap  = new Map(state.sources.map((s) => [s.id, s]));
+  const sourceMap   = new Map(state.sources.map((s) => [s.id, s]));
   const displayRefs = getClipDisplayRefs(state.timeline);
 
-  const lines = ordered.map((clip) => {
-    const source   = sourceMap.get(clip.sourceId);
-    const name     = clip.label !== source?.fileName ? clip.label : (source?.fileName ?? clip.sourceId);
+  const rows = ordered.map((clip) => {
+    const source = sourceMap.get(clip.sourceId);
+    const name   = clip.label !== source?.fileName ? clip.label : (source?.fileName ?? clip.sourceId);
+    return { clip, name, ref: displayRefs.get(clip.id) ?? "?" };
+  });
+
+  const refWidth  = Math.max(...rows.map((r) => r.ref.length));
+  const nameWidth = Math.min(32, Math.max(12, ...rows.map((r) => r.name.length)));
+
+  const lines = rows.map(({ clip, name, ref }) => {
     const duration = clip.outPoint - clip.inPoint;
-    const ref      = displayRefs.get(clip.id) ?? "?";
-    const index    = chalk.dim(`[${ref}]`);
-    const nameStr  = chalk.white(name.padEnd(24));
-    const range    = chalk.dim(`${formatDuration(clip.inPoint)} → ${formatDuration(clip.outPoint)}`);
-    const dur      = chalk.dim(`(${formatSeconds(duration)})`);
-    const tag      = clip.userLabel ? "  " + chalk.dim(`♦ ${clip.userLabel}`) : "";
-    return `  ${index} ${nameStr} ${range}  ${dur}${tag}`;
+    const refCol   = paint.accent(`[${ref}]`.padEnd(refWidth + 2));
+    const nameCol  = paint.emphasis(name.slice(0, nameWidth).padEnd(nameWidth));
+    const range    = paint.muted(`${formatDuration(clip.inPoint)} ${glyphs.arrow} ${formatDuration(clip.outPoint)}`);
+    const dur      = paint.muted(`(${formatSeconds(duration)})`);
+    const tag      = clip.userLabel ? "  " + paint.warning(`${glyphs.label} ${clip.userLabel}`) : "";
+    return `  ${refCol} ${nameCol} ${range}  ${dur}${tag}`;
   });
 
   return lines.join("\n");

@@ -1,15 +1,8 @@
-import chalk from "chalk";
 import type { ProjectState, Clip } from "../project/types.js";
 import { clipsInOrder } from "../project/types.js";
+import { paint, clipPaint, glyphs, stripAnsi } from "../ui/theme.js";
 
 // ── Constants ──────────────────────────────────────────────────────────────────
-
-const CLIP_COLORS = [
-  chalk.cyan,
-  chalk.yellow,
-  chalk.magenta,
-  chalk.green,
-] as const;
 
 const TIME_INTERVALS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600];
 
@@ -48,8 +41,6 @@ interface VisualGroup {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-const stripAnsi = (s: string) => s.replace(/\x1B\[[0-9;]*m/g, "");
 
 function formatMarker(seconds: number): string {
   const s = Math.round(seconds);
@@ -152,8 +143,8 @@ function buildViewportGroups(
     lastVisibleIdx = i;
 
     let label = clip.label;
-    if (slice.clippedLeft)  label = `◀ ${label}`;
-    if (slice.clippedRight) label = `${label} ▶`;
+    if (slice.clippedLeft)  label = `${glyphs.clippedLeft} ${label}`;
+    if (slice.clippedRight) label = `${label} ${glyphs.clippedRight}`;
 
     candidates.push({
       clips: [clip],
@@ -282,8 +273,8 @@ export function renderTimeline(
   const barWidth   = Math.max(4, innerWidth - 2);
 
   const box = {
-    top:    `  ┌${"─".repeat(innerWidth + 2)}┐`,
-    bottom: `  └${"─".repeat(innerWidth + 2)}┘`,
+    top:    `  ╭${"─".repeat(innerWidth + 2)}╮`,
+    bottom: `  ╰${"─".repeat(innerWidth + 2)}╯`,
     row: (content: string) => {
       const stripped = stripAnsi(content);
       const pad = Math.max(0, innerWidth - stripped.length);
@@ -294,13 +285,13 @@ export function renderTimeline(
   const clips = clipsInOrder(state.timeline);
 
   if (clips.length === 0) {
-    return [box.top, box.row(chalk.dim("No clips on timeline")), box.bottom].join("\n");
+    return [box.top, box.row(paint.muted("No clips on timeline")), box.bottom].join("\n");
   }
 
   const totalDuration = clips.reduce((sum, c) => sum + clipDuration(c), 0);
 
   if (totalDuration === 0) {
-    return [box.top, box.row(chalk.dim("No clips on timeline")), box.bottom].join("\n");
+    return [box.top, box.row(paint.muted("No clips on timeline")), box.bottom].join("\n");
   }
 
   // Resolve viewport — default covers the full timeline
@@ -315,8 +306,8 @@ export function renderTimeline(
   );
 
   if (groups.length === 0) {
-    const msg = `No clips in this view  ◀ ${offScreenLeft}  ▶ ${offScreenRight}`;
-    return [box.top, box.row(chalk.dim(msg)), box.bottom].join("\n");
+    const msg = `No clips in this view  ${glyphs.clippedLeft} ${offScreenLeft}  ${glyphs.clippedRight} ${offScreenRight}`;
+    return [box.top, box.row(paint.muted(msg)), box.bottom].join("\n");
   }
 
   const widths = assignWidths(groups, barWidth);
@@ -351,14 +342,14 @@ export function renderTimeline(
     nextFreePos = start + label.length + 1;
   }
 
-  const rulerLine = chalk.dim(rulerChars.join(""));
-  const tickLine  = chalk.dim(tickChars.join(""));
+  const rulerLine = paint.muted(rulerChars.join(""));
+  const tickLine  = paint.muted(tickChars.join(""));
 
   // ── Clip bar ──────────────────────────────────────────────────────────────────
   let clipBar = "";
   groups.forEach((group, idx) => {
     const w     = widths[idx]!;
-    const color = CLIP_COLORS[group.colorIndex % CLIP_COLORS.length]!;
+    const color = clipPaint(group.colorIndex);
     const border = color("│");
 
     if (w === 1) {
@@ -372,23 +363,26 @@ export function renderTimeline(
     clipBar += border + color(` ${label}${fill}`);
   });
   const lastGroup = groups[groups.length - 1]!;
-  clipBar += CLIP_COLORS[lastGroup.colorIndex % CLIP_COLORS.length]!("│");
+  clipBar += clipPaint(lastGroup.colorIndex)("│");
 
   // ── Bottom bar ────────────────────────────────────────────────────────────────
-  const bottomBar = chalk.dim("└" + "─".repeat(barWidth));
+  const bottomBar = paint.muted("└" + "─".repeat(barWidth));
 
   // ── Summary ───────────────────────────────────────────────────────────────────
-  let summary = `Total: ${formatTotal(totalDuration)}  ·  ${clips.length} clip${clips.length === 1 ? "" : "s"}`;
-  if (offScreenLeft > 0)  summary += `  ·  ◀ ${offScreenLeft}`;
-  if (offScreenRight > 0) summary += `  ▶ ${offScreenRight}`;
+  let summary = `Total: ${formatTotal(totalDuration)}  ${glyphs.bullet}  ${clips.length} clip${clips.length === 1 ? "" : "s"}`;
+  if (offScreenLeft > 0)  summary += `  ${glyphs.bullet}  ${glyphs.clippedLeft} ${offScreenLeft}`;
+  if (offScreenRight > 0) summary += `  ${glyphs.clippedRight} ${offScreenRight}`;
+  // At extreme narrow widths the summary is the one row that can outgrow the
+  // box — truncate (plain text, pre-styling) rather than overflow the frame.
+  if (summary.length > innerWidth) summary = summary.slice(0, innerWidth - 1) + glyphs.ellipsis;
 
   return [
     box.top,
-    box.row(chalk.dim(rulerLine)),
-    box.row(chalk.dim(tickLine)),
+    box.row(rulerLine),
+    box.row(tickLine),
     box.row(clipBar),
     box.row(bottomBar),
-    box.row(chalk.dim(summary)),
+    box.row(paint.muted(summary)),
     box.bottom,
   ].join("\n");
 }

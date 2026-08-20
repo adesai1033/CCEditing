@@ -17,12 +17,14 @@ import {
 } from "../../project/session.js";
 import { setClipUserLabel, clearClipUserLabel } from "../../project/mutations.js";
 import { getDefaultIndexRegistry } from "../../agent/indexing.js";
-import chalk from "chalk";
+import { paint, glyphs } from "../../ui/theme.js";
 import { loadOrCreateProject, saveProjectToStandardPath } from "../../cli/project-context.js";
 import { parseTime } from "../../utils/time.js";
 import { execute } from "../../engine/engine.js";
 import { runAgent, type AgentInput, type ProgressEvent } from "../../agent/loop.js";
 import type { PlanForConfirmation } from "../../agent/propose_edit_plan.js";
+import { parsePreviewArgs, previewStateScope, type PreviewDeps } from "./preview.js";
+import { getSessionTotals, renderCostReport } from "../cost.js";
 
 export interface ReplState {
   session: ProjectSession | null;
@@ -39,6 +41,12 @@ export interface DispatchResult {
   newState?: ReplState;
   shouldExit?: boolean;
   activatesTimeline?: boolean;
+  /** True when `output` is agent prose (possibly markdown) and must be
+   *  rendered through the markdown renderer before reaching the terminal.
+   *  Slash-command output is pre-styled and must NOT be re-rendered. */
+  markdown?: boolean;
+  /** 3K: /clear also empties any queued type-ahead input. */
+  clearsInputQueue?: boolean;
 }
 
 export type ConfirmFn = (plan: PlanForConfirmation) => Promise<{ approved: boolean }>;
@@ -49,6 +57,12 @@ export interface DispatchOptions {
   confirm?: ConfirmFn;
   /** Optional progress hook so the REPL can render tool calls inline. */
   onAgentProgress?: (event: ProgressEvent) => void;
+  /** Render progress for /preview (0–100), shown as a dim line. */
+  onPreviewProgress?: (percent: number) => void;
+  /** Abort signal for /preview renders (Ctrl-C cancels, decision 6). */
+  previewSignal?: AbortSignal;
+  /** Injected for tests — preview render/player seams (defaults are real). */
+  previewDeps?: Pick<PreviewDeps, "render" | "open">;
   /** Injected for tests — defaults to runAgent. */
   agent?: (input: AgentInput) => Promise<{
     messages: NeutralMessage[];
@@ -86,8 +100,10 @@ export async function dispatch(
     case "undo":     return withSlashContinuity(await dispatchUndo(state), state);
     case "redo":     return withSlashContinuity(await dispatchRedo(state), state);
     case "export":   return dispatchExport(args, state);
+    case "preview":  return dispatchPreview(args, state, options);
     case "auto":     return dispatchAuto(args, state);
     case "critic":   return dispatchCritic(args, state);
+    case "cost":     return dispatchCost();
     case "clear":    return dispatchClear(state);
     default:         return { output: `Unknown command: /${cmd}. Type /help for available commands.`, isError: true };
   }
@@ -128,7 +144,7 @@ function withSlashContinuity(result: DispatchResult, prevState: ReplState): Disp
  */
 function synthesizeSlashNote(output: string): string {
   const firstLine = output.split("\n").find((l) => l.trim().length > 0) ?? "";
-  // Remove ANSI escape codes (chalk) and trim
+  // Remove ANSI escape codes and trim
   const clean = firstLine.replace(/\x1B\[[0-9;]*m/g, "").trim();
   return clean;
 }
@@ -172,7 +188,7 @@ async function dispatchOpen(args: string[], state: ReplState): Promise<DispatchR
   let indexNote = "";
   if (process.env["TWELVELABS_API_KEY"] && newSource.analyses.twelveLabs?.status !== "indexed") {
     getDefaultIndexRegistry().start({ id: newSource.id, filePath: newSource.filePath });
-    indexNote = "\n" + chalk.dim("⟳ visual indexing started in background");
+    indexNote = "\n" + paint.muted(`${glyphs.sync} visual indexing started in background`);
   }
 
   const clipCount = clipsInOrder(result.session.state.timeline).length;
@@ -504,6 +520,35 @@ async function dispatchExport(args: string[], state: ReplState): Promise<Dispatc
   };
 }
 
+// ── /preview ──────────────────────────────────────────────────────────────────
+//
+// Read-only (decisions 1 & 9): renders the CURRENT timeline (or a clip / a
+// timeline-time range of it) to a temp file and opens the system player.
+// Returns no newState, so no synthetic continuity message is ever injected.
+
+async function dispatchPreview(
+  args: string[],
+  state: ReplState,
+  options: DispatchOptions,
+): Promise<DispatchResult> {
+  if (!state.session) return { output: "No project open. Use /open first.", isError: true };
+
+  const parsed = parsePreviewArgs(args);
+  if (!parsed.ok) return { output: parsed.error, isError: true };
+
+  const outcome = await previewStateScope(state.session.state, parsed.scope, {
+    onProgress: options.onPreviewProgress,
+    signal: options.previewSignal,
+    ...options.previewDeps,
+  });
+
+  if (!outcome.ok) {
+    // A user-cancelled render is a normal outcome, not an error.
+    return { output: outcome.error, isError: !outcome.aborted };
+  }
+  return { output: outcome.message, isError: false };
+}
+
 // ── /auto ─────────────────────────────────────────────────────────────────────
 
 function dispatchAuto(args: string[], state: ReplState): DispatchResult {
@@ -571,7 +616,17 @@ function dispatchClear(state: ReplState): DispatchResult {
     output: "Agent conversation cleared. Project state and undo history are unchanged.",
     isError: false,
     newState: { ...state, messages: [] },
+    clearsInputQueue: true,
   };
+}
+
+// ── /cost ─────────────────────────────────────────────────────────────────────
+//
+// Session-scoped token readout by role (3K). Usage flows in through the
+// default provider's tap as turns complete; this just renders the fold.
+
+function dispatchCost(): DispatchResult {
+  return { output: renderCostReport(getSessionTotals()), isError: false };
 }
 
 // ── Agent (non-slash input) ───────────────────────────────────────────────────
@@ -607,6 +662,7 @@ async function dispatchAgent(
       return {
         output: `${result.output}\n\nWarning: failed to save project — ${saved.error}`,
         isError: true,
+        markdown: true,
         newState: { ...state, session: result.session, messages: result.messages },
       };
     }
@@ -615,6 +671,9 @@ async function dispatchAgent(
   return {
     output: result.output,
     isError: result.isError,
+    // Agent prose — success or error — always renders through the markdown
+    // seam (3I.5 fix): there is no path by which it reaches the terminal raw.
+    markdown: true,
     newState: {
       ...state,
       session: result.session,

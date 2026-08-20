@@ -16,6 +16,7 @@ import { join } from "node:path";
 
 const REPO_ROOT = new URL("../../", import.meta.url).pathname;
 const AGENT_DIR = join(REPO_ROOT, "src", "agent");
+const SRC_DIR = join(REPO_ROOT, "src");
 
 function walkTs(dir: string): string[] {
   const out: string[] = [];
@@ -60,6 +61,11 @@ describe("architecture guard", () => {
       join(AGENT_DIR, "tools", "survey_sources.ts"),
       join(AGENT_DIR, "critic.ts"),
       join(AGENT_DIR, "critic-prompt.ts"),
+      // 3H: preview joins the read-only club. It computes scratch states via
+      // applyOperations (the pure half) and must never reach the committing
+      // applyPlan or the plan tool.
+      join(SRC_DIR, "engine", "preview.ts"),
+      join(SRC_DIR, "repl", "commands", "preview.ts"),
     ];
     const offenders: string[] = [];
     // Match imports of applyPlan, propose_edit_plan module, or the session write API.
@@ -73,5 +79,27 @@ describe("architecture guard", () => {
       }
     }
     assert.deepEqual(offenders, [], `scout path must not import write functions`);
+  });
+
+  // 3I presentation guard (decision 2): every color, dim treatment, and status
+  // glyph in the REPL and display layers comes from src/ui/theme.ts. A raw
+  // literal anywhere else re-scatters the styling this slice unified.
+  test("no color or status-glyph literals outside the theme module", () => {
+    const files = [
+      ...walkTs(join(SRC_DIR, "repl")),
+      ...walkTs(join(SRC_DIR, "display")),
+    ];
+    const forbidden = /\bchalk\b|\bdimColor\b|\bcolor=|\bborderColor=|[✓✗⚠✻⟳♦◀▶]/;
+    const offenders: string[] = [];
+    for (const file of files) {
+      const text = readFileSync(file, "utf-8");
+      const lines = text.split("\n");
+      for (let i = 0; i < lines.length; i++) {
+        if (forbidden.test(lines[i]!)) {
+          offenders.push(`${file}:${i + 1}: ${lines[i]!.trim()}`);
+        }
+      }
+    }
+    assert.deepEqual(offenders, [], "style literals must live in src/ui/theme.ts only");
   });
 });

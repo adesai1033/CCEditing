@@ -109,21 +109,39 @@ export function applyPlan(
 ): ApplyResult {
   if (ops.length === 0) return { ok: true, session };
 
-  let running = session.state;
+  const result = applyOperations(session.state, ops);
+  if (!result.ok) return { ok: false, error: result.error, failedAt: result.failedAt };
+
+  return {
+    ok: true,
+    session: {
+      state: result.state,
+      undo: [...session.undo, { state: session.state, label }],
+      redo: [],
+    },
+  };
+}
+
+export type OperationsResult =
+  | { ok: true; state: ProjectState }
+  | { ok: false; error: string; failedAt: number };
+
+/**
+ * Apply operations sequentially against a bare state and return the resulting
+ * state — no session, no undo entry, no persistence. This is the single
+ * implementation of operation semantics: applyPlan wraps it to commit, and
+ * preview (3H) calls it to compute a scratch post-plan state that is rendered
+ * and discarded. There must never be a second implementation — a preview that
+ * diverges from the real apply is worse than no preview.
+ */
+export function applyOperations(state: ProjectState, ops: Operation[]): OperationsResult {
+  let running = state;
   for (let i = 0; i < ops.length; i++) {
     const result = executeOperation(running, ops[i]!);
     if (!result.ok) return { ok: false, error: result.error, failedAt: i };
     running = result.state;
   }
-
-  return {
-    ok: true,
-    session: {
-      state: running,
-      undo: [...session.undo, { state: session.state, label }],
-      redo: [],
-    },
-  };
+  return { ok: true, state: running };
 }
 
 function executeOperation(state: ProjectState, op: Operation): MutationResult {

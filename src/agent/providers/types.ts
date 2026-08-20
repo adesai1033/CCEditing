@@ -87,6 +87,9 @@ export interface ChatRequest {
   maxTokens: number;
   /** When enabled, the provider turns on its reasoning mode (3E-2.5). */
   reasoning?: ReasoningConfig;
+  /** Which agent context issued this request (3K). Display/accounting metadata
+   *  only — providers ignore it; the usage tap uses it for /cost attribution. */
+  role?: "director" | "scout" | "critic";
 }
 
 /**

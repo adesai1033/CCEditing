@@ -142,6 +142,7 @@ export async function runScout(sourceId: string, state: ProjectState, deps: Scou
       const response = await deps.provider.send({
         system, messages, tools, maxTokens,
         reasoning: { enabled: false },   // scouts distill; they don't plan
+        role: "scout",
       });
 
       messages = [...messages, { role: "assistant", content: response.content }];

@@ -128,6 +128,7 @@ export async function runCritic(input: CriticInput, deps: CriticDeps): Promise<C
         tools: [submitReviewSchema],
         maxTokens: deps.maxTokens ?? CRITIC_MAX_TOKENS,
         reasoning: { enabled: true },   // review is a judgment task (decision 7)
+        role: "critic",
       });
 
       const tu = response.content.find(

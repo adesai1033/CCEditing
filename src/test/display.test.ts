@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { renderTimeline } from "../display/timeline.js";
 import { renderClipList } from "../display/timeline-clip-list.js";
 import { createProject } from "../project/io.js";
-import { addSource, trimClip, reorderClip, splitClip, removeClip } from "../project/mutations.js";
+import { addSource, trimClip, reorderClip, splitClip, removeClip, setClipUserLabel } from "../project/mutations.js";
 import { clipsInOrder } from "../project/types.js";
 import type { ProjectState } from "../project/types.js";
 import type { MediaInfo } from "../media/types.js";
@@ -57,14 +57,30 @@ describe("renderTimeline", () => {
     assert.equal(lines.length, 7);
   });
 
-  test("box borders are present", () => {
+  test("box borders are present (rounded, 3I)", () => {
     const state = makeProject();
     const out = strip(renderTimeline(state, WIDTH));
     const lines = out.split("\n");
-    assert.ok(lines[0]!.includes("┌"));
-    assert.ok(lines[0]!.includes("┐"));
-    assert.ok(lines[6]!.includes("└"));
-    assert.ok(lines[6]!.includes("┘"));
+    assert.ok(lines[0]!.includes("╭"));
+    assert.ok(lines[0]!.includes("╮"));
+    assert.ok(lines[6]!.includes("╰"));
+    assert.ok(lines[6]!.includes("╯"));
+  });
+
+  test("every line fits within an 80-column terminal", () => {
+    const state = makeProject([{ duration: 45 }, { duration: 90 }, { duration: 15 }]);
+    const out = strip(renderTimeline(state, 80));
+    for (const line of out.split("\n")) {
+      assert.ok(line.length <= 80, `line overflows 80 cols (${line.length}): ${line}`);
+    }
+  });
+
+  test("every line fits within a narrow 60-column terminal", () => {
+    const state = makeProject([{ duration: 45 }, { duration: 90 }]);
+    const out = strip(renderTimeline(state, 60));
+    for (const line of out.split("\n")) {
+      assert.ok(line.length <= 60, `line overflows 60 cols (${line.length}): ${line}`);
+    }
   });
 
   test("clip label appears in bar", () => {
@@ -284,5 +300,26 @@ describe("renderClipList", () => {
     const state = makeProject([{ duration: 120 }]);
     const out = strip(renderClipList(state));
     assert.match(out, /\(2m\)/);
+  });
+
+  test("a user label (3E-3 /label) renders as a trailing chip", () => {
+    let state = makeProject([{}, {}]);
+    const [first] = clipsInOrder(state.timeline);
+    const r = setClipUserLabel(state, first!.id, "good take");
+    assert.ok(r.ok);
+    state = r.state;
+
+    const out = strip(renderClipList(state));
+    assert.match(out, /♦ good take/);
+    // Only the labeled clip carries the chip.
+    assert.equal(out.split("♦").length - 1, 1);
+  });
+
+  test("columns align: every ref column starts at the same offset", () => {
+    const state = makeProject([{ fileName: "a.mp4" }, { fileName: "longer-name.mp4" }, { fileName: "b.mp4" }]);
+    const out = strip(renderClipList(state));
+    const lines = out.split("\n");
+    const offsets = new Set(lines.map((l) => l.indexOf("[")));
+    assert.equal(offsets.size, 1, "ref brackets must align vertically");
   });
 });

@@ -1,5 +1,5 @@
-import chalk from "chalk";
 import type { MediaInfo } from "../media/types.js";
+import { paint, glyphs, stripAnsi } from "../ui/theme.js";
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
 
@@ -127,22 +127,22 @@ export function renderTrimSuccess(r: TrimResultDisplay): string {
   ];
 
   const labelWidth = Math.max(...rows.map(([l]) => l.length));
-  const stripAnsi = (s: string) => s.replace(/\x1B\[[0-9;]*m/g, "");
 
   const contentRows = rows.map(([label, value]) =>
-    `${chalk.dim(label.padEnd(labelWidth))}  ${chalk.white(value)}`
+    `${paint.muted(label.padEnd(labelWidth))}  ${paint.emphasis(value)}`
   );
 
   const innerWidth = Math.max(...contentRows.map((r) => stripAnsi(r).length)) + 2;
   const padRight = (stripped: string, raw: string) =>
     `  │ ${raw}${" ".repeat(Math.max(0, innerWidth - stripped.length))} │`;
 
+  const title = `${glyphs.done} Trimmed successfully`;
   const lines = [
-    `  ┌${"─".repeat(innerWidth + 2)}┐`,
-    `  │ ${chalk.bold.green("✓ Trimmed successfully")}${" ".repeat(Math.max(0, innerWidth - "✓ Trimmed successfully".length))} │`,
+    `  ╭${"─".repeat(innerWidth + 2)}╮`,
+    `  │ ${paint.successEmphasis(title)}${" ".repeat(Math.max(0, innerWidth - title.length))} │`,
     `  ├${"─".repeat(innerWidth + 2)}┤`,
     ...contentRows.map((r) => padRight(stripAnsi(r), r)),
-    `  └${"─".repeat(innerWidth + 2)}┘`,
+    `  ╰${"─".repeat(innerWidth + 2)}╯`,
   ];
 
   return lines.join("\n");
@@ -174,18 +174,17 @@ export function renderMediaInfo(info: MediaInfo): string {
   const labelWidth = Math.max(...rows.map(([l]) => l.length));
   const contentRows = rows.map(([label, value]) => {
     const paddedLabel = label.padEnd(labelWidth);
-    return `${chalk.dim(paddedLabel)}  ${chalk.white(value)}`;
+    return `${paint.muted(paddedLabel)}  ${paint.emphasis(value)}`;
   });
 
   // Measure box width: max of filename length and longest content row (stripped of ANSI)
-  const stripAnsi = (s: string) => s.replace(/\x1B\[[0-9;]*m/g, "");
   const innerWidth = Math.max(
     info.fileName.length,
     ...contentRows.map((r) => stripAnsi(r).length)
   ) + 2; // 2 = left/right padding
 
-  const top    = `  ┌${"─".repeat(innerWidth + 2)}┐`;
-  const bottom = `  └${"─".repeat(innerWidth + 2)}┘`;
+  const top    = `  ╭${"─".repeat(innerWidth + 2)}╮`;
+  const bottom = `  ╰${"─".repeat(innerWidth + 2)}╯`;
   const sep    = `  ├${"─".repeat(innerWidth + 2)}┤`;
 
   const padRight = (stripped: string, raw: string): string => {
@@ -193,7 +192,7 @@ export function renderMediaInfo(info: MediaInfo): string {
     return `  │ ${raw}${" ".repeat(Math.max(0, pad))} │`;
   };
 
-  const titleLine = padRight(info.fileName, chalk.bold.cyan(info.fileName));
+  const titleLine = padRight(info.fileName, paint.heading(info.fileName));
   const contentLines = contentRows.map((r) => padRight(stripAnsi(r), r));
 
   return [top, titleLine, sep, ...contentLines, bottom].join("\n");
