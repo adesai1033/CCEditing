@@ -1,7 +1,8 @@
-import { test, describe, beforeEach } from "node:test";
+import { test, describe, beforeEach, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 import {
   EMPTY_QUEUE, typeIntoQueue, backspaceQueue, markQueueReady,
@@ -27,6 +28,20 @@ import { createSession } from "../project/session.js";
 import { clipsInOrder } from "../project/types.js";
 import type { ProjectState } from "../project/types.js";
 import type { MediaInfo } from "../media/types.js";
+
+
+// Isolate CWD: dispatch persists the conversation sidecar to the working
+// directory (3E-8); tests must not write into the repo root.
+let __cwdDir: string;
+const __originalCwd = process.cwd();
+before(() => {
+  __cwdDir = mkdtempSync(join(tmpdir(), "cutcli-affordances-test-"));
+  process.chdir(__cwdDir);
+});
+after(() => {
+  process.chdir(__originalCwd);
+  try { rmSync(__cwdDir, { recursive: true, force: true }); } catch {}
+});
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 

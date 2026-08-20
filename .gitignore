@@ -7,3 +7,4 @@ dist/
 
 # Local project state (absolute paths, per-machine)
 .cutcli.json
+.cutcli-session.json

@@ -15,6 +15,7 @@ import { clipCompletions } from "./completions.js";
 import { recordUsage } from "./cost.js";
 import { setUsageListener } from "../agent/providers/default.js";
 import { pushTurnDetail, formatDetailValue, MAX_DETAIL_TURNS, type DetailItem, type TurnDetail } from "./turn-detail.js";
+import { peekSession } from "./session-store.js";
 import { renderTimeline, type ViewportState } from "../display/timeline.js";
 import { renderClipList } from "../display/timeline-clip-list.js";
 import { loadOrCreateProject } from "../cli/project-context.js";
@@ -102,10 +103,15 @@ export function App() {
       if (ctx.ok && ctx.existed) {
         setReplState((s) => ({ ...s, session: ctx.session }));
         const clipCount = clipsInOrder(ctx.session.state.timeline).length;
+        // 3E-8: resume is opt-in — announce a saved conversation, don't load it.
+        const saved = await peekSession();
+        const resumeNote = saved.exists && saved.messageCount > 0
+          ? `  ${glyphs.bullet}  saved conversation found (/resume to continue, /clear to discard)`
+          : "";
         setEntries([{
           id,
           input: "(startup)",
-          output: `Loaded project  ·  ${clipCount} clip${clipCount === 1 ? "" : "s"}`,
+          output: `Loaded project  ·  ${clipCount} clip${clipCount === 1 ? "" : "s"}${resumeNote}`,
           isError: false,
         }]);
       }
@@ -274,6 +280,18 @@ export function App() {
     setLiveTurn(null);
     setTurnActive(false);
     setPendingEntry(null);
+    // 3E-8, decision 13: compaction is lossy — mark it visibly so nobody is
+    // confused about why the agent forgot something.
+    if (result.compacted) {
+      const c = result.compacted;
+      setEntries((prev) => [...prev, {
+        id: crypto.randomUUID(),
+        input: "",
+        output: `— compacted (${c.turns} turn${c.turns === 1 ? "" : "s"} ${glyphs.bullet} ~${Math.round(c.beforeTokens / 1000)}k → ~${Math.round(c.afterTokens / 1000)}k tokens) —`,
+        isError: false,
+        dim: true,
+      }]);
+    }
     setEntries((prev) => [...prev, {
       id: pendingId,
       input: trimmed,

@@ -23,6 +23,8 @@ export const COMMANDS: CommandDef[] = [
   { name: "redo",     group: "History", syntax: "/redo",                       description: "Redo the most recently undone change" },
   { name: "auto",     group: "Agent",   syntax: "/auto [on|off]",              description: "Toggle agent approve-all mode" },
   { name: "critic",   group: "Agent",   syntax: "/critic [on|off]",            description: "Toggle plan review before confirmation (default on)" },
+  { name: "compact",  group: "Agent",   syntax: "/compact",                    description: "Compact conversation history (also automatic when it grows)" },
+  { name: "resume",   group: "Agent",   syntax: "/resume",                     description: "Resume this project's saved conversation" },
   { name: "clear",    group: "Agent",   syntax: "/clear",                      description: "Reset agent conversation memory (state untouched)" },
   { name: "cost",     group: "Session", syntax: "/cost",                       description: "Show session token usage by role (director / scouts / critic)" },
   { name: "help",     group: "Session", syntax: "/help",                       description: "Show this help message" },

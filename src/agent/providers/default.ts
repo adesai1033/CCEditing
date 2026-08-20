@@ -1,5 +1,12 @@
-import { AnthropicProvider } from "./anthropic.js";
+import { AnthropicProvider, MODEL_DEFAULT } from "./anthropic.js";
 import type { ChatProvider, ChatResponse } from "./types.js";
+
+/**
+ * Identity of the default provider/model, stamped into the persisted session
+ * sidecar (3E-8): reasoning blocks are model-bound, so a load under a
+ * different provider or model strips them rather than replaying them.
+ */
+export const DEFAULT_PROVIDER_INFO = { provider: "anthropic", model: MODEL_DEFAULT } as const;
 
 /**
  * The default production provider, cached. Lazy so the fail-fast missing-key

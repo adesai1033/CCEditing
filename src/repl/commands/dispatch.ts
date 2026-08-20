@@ -25,6 +25,9 @@ import { runAgent, type AgentInput, type ProgressEvent } from "../../agent/loop.
 import type { PlanForConfirmation } from "../../agent/propose_edit_plan.js";
 import { parsePreviewArgs, previewStateScope, type PreviewDeps } from "./preview.js";
 import { getSessionTotals, renderCostReport } from "../cost.js";
+import { saveSession, loadSession } from "../session-store.js";
+import { compactHistory, shouldAutoCompact, type CompactResult } from "../compaction.js";
+import { buildDefaultProvider, DEFAULT_PROVIDER_INFO } from "../../agent/providers/default.js";
 
 export interface ReplState {
   session: ProjectSession | null;
@@ -47,6 +50,9 @@ export interface DispatchResult {
   markdown?: boolean;
   /** 3K: /clear also empties any queued type-ahead input. */
   clearsInputQueue?: boolean;
+  /** 3E-8: set when history was compacted this dispatch — the REPL renders a
+   *  visible divider so nobody is confused about why the agent forgot something. */
+  compacted?: { turns: number; beforeTokens: number; afterTokens: number };
 }
 
 export type ConfirmFn = (plan: PlanForConfirmation) => Promise<{ approved: boolean }>;
@@ -63,6 +69,8 @@ export interface DispatchOptions {
   previewSignal?: AbortSignal;
   /** Injected for tests — preview render/player seams (defaults are real). */
   previewDeps?: Pick<PreviewDeps, "render" | "open">;
+  /** Injected for tests — defaults to compactHistory (3E-8). */
+  compact?: typeof compactHistory;
   /** Injected for tests — defaults to runAgent. */
   agent?: (input: AgentInput) => Promise<{
     messages: NeutralMessage[];
@@ -76,6 +84,22 @@ export async function dispatch(
   raw: string,
   state: ReplState,
   options: DispatchOptions = {},
+): Promise<DispatchResult> {
+  const result = await route(raw, state, options);
+  // 3E-8, decision 2: persist conversation on turn completion — any dispatch
+  // that changed conversation memory (agent turns, continuity notes, /clear,
+  // /compact, /resume) saves the sidecar. Atomic write inside; a failed save
+  // is swallowed (conversation is convenience, never a blocker).
+  if (result.newState && result.newState.messages !== state.messages) {
+    await saveSession(result.newState.messages, DEFAULT_PROVIDER_INFO);
+  }
+  return result;
+}
+
+async function route(
+  raw: string,
+  state: ReplState,
+  options: DispatchOptions,
 ): Promise<DispatchResult> {
   const trimmed = raw.trim();
 
@@ -104,6 +128,8 @@ export async function dispatch(
     case "auto":     return dispatchAuto(args, state);
     case "critic":   return dispatchCritic(args, state);
     case "cost":     return dispatchCost();
+    case "compact":  return dispatchCompact(state, options);
+    case "resume":   return dispatchResume(state);
     case "clear":    return dispatchClear(state);
     default:         return { output: `Unknown command: /${cmd}. Type /help for available commands.`, isError: true };
   }
@@ -609,6 +635,68 @@ function dispatchCritic(args: string[], state: ReplState): DispatchResult {
   return { output: "Usage: /critic [on|off|status]", isError: true };
 }
 
+// ── /compact (3E-8) ───────────────────────────────────────────────────────────
+//
+// Manual compaction. The automatic trigger fires before an agent turn when
+// the estimate crosses the threshold; this lets the user force it anytime.
+
+async function dispatchCompact(state: ReplState, options: DispatchOptions): Promise<DispatchResult> {
+  if (state.messages.length === 0) {
+    return { output: "Nothing to compact — conversation is empty.", isError: false };
+  }
+  const compact = options.compact ?? compactHistory;
+  const result = await compact(state.messages, { getProvider: () => buildDefaultProvider() });
+  if (result.compactedTurns === 0) {
+    return {
+      output: `Nothing beyond the recent window to compact — history is ~${fmtTokens(result.beforeTokens)} tokens.`,
+      isError: false,
+    };
+  }
+  return {
+    output: `Compacted ${result.compactedTurns} turn${result.compactedTurns === 1 ? "" : "s"}: ~${fmtTokens(result.beforeTokens)} → ~${fmtTokens(result.afterTokens)} tokens (${result.tiersApplied.join(" + ")}). Recent turns kept verbatim.`,
+    isError: false,
+    newState: { ...state, messages: result.messages },
+    compacted: { turns: result.compactedTurns, beforeTokens: result.beforeTokens, afterTokens: result.afterTokens },
+  };
+}
+
+function fmtTokens(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n);
+}
+
+// ── /resume (3E-8) ────────────────────────────────────────────────────────────
+//
+// Explicitly reopen the persisted conversation for this project. Resume is
+// opt-in: startup only announces that a saved conversation exists.
+
+async function dispatchResume(state: ReplState): Promise<DispatchResult> {
+  const loaded = await loadSession(DEFAULT_PROVIDER_INFO);
+  if (!loaded.ok) {
+    if (loaded.reason === "missing") {
+      return { output: "No saved conversation for this project.", isError: false };
+    }
+    return {
+      output: `Saved conversation couldn't be read (${loaded.error ?? "corrupt file"}) — starting fresh. Project state is unaffected.`,
+      isError: true,
+    };
+  }
+  if (loaded.messages.length === 0) {
+    return { output: "The saved conversation is empty.", isError: false };
+  }
+  const notes = [
+    `Resumed conversation: ${loaded.messages.length} messages (saved ${loaded.savedAt}).`,
+    "Old perception results were elided — the agent works from the current timeline snapshot.",
+  ];
+  if (loaded.strippedReasoning) {
+    notes.push("Reasoning blocks were stripped: the saved session came from a different provider/model.");
+  }
+  return {
+    output: notes.join("\n"),
+    isError: false,
+    newState: { ...state, messages: loaded.messages },
+  };
+}
+
 // ── /clear ────────────────────────────────────────────────────────────────────
 
 function dispatchClear(state: ReplState): DispatchResult {
@@ -643,11 +731,22 @@ async function dispatchAgent(
     return { output: "Internal error: confirm callback not provided.", isError: true };
   }
 
+  // 3E-8, decision 11: auto-compact BEFORE the turn when the estimate crosses
+  // the threshold — never silently; the caller renders a visible divider.
+  let messages = state.messages;
+  let compactedInfo: DispatchResult["compacted"];
+  if (shouldAutoCompact(messages)) {
+    const compact = options.compact ?? compactHistory;
+    const c: CompactResult = await compact(messages, { getProvider: () => buildDefaultProvider() });
+    messages = c.messages;
+    compactedInfo = { turns: c.compactedTurns, beforeTokens: c.beforeTokens, afterTokens: c.afterTokens };
+  }
+
   const run = options.agent ?? runAgent;
   const result = await run({
     userPrompt: prompt,
     session: state.session,
-    messages: state.messages,
+    messages,
     autoApprove: state.autoApprove,
     criticEnabled: state.criticEnabled !== false,
     confirm: options.confirm,
@@ -663,6 +762,7 @@ async function dispatchAgent(
         output: `${result.output}\n\nWarning: failed to save project — ${saved.error}`,
         isError: true,
         markdown: true,
+        compacted: compactedInfo,
         newState: { ...state, session: result.session, messages: result.messages },
       };
     }
@@ -674,6 +774,7 @@ async function dispatchAgent(
     // Agent prose — success or error — always renders through the markdown
     // seam (3I.5 fix): there is no path by which it reaches the terminal raw.
     markdown: true,
+    compacted: compactedInfo,
     newState: {
       ...state,
       session: result.session,

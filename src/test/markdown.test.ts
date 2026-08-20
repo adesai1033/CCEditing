@@ -1,7 +1,8 @@
-import { test, describe } from "node:test";
+import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 import { renderAgentProse, stripMarkdown, presentOutput } from "../ui/markdown.js";
 import { stripAnsi } from "../ui/theme.js";
@@ -11,6 +12,20 @@ import { createProject } from "../project/io.js";
 import { addSource } from "../project/mutations.js";
 import { createSession } from "../project/session.js";
 import type { MediaInfo } from "../media/types.js";
+
+
+// Isolate CWD: dispatch persists the conversation sidecar to the working
+// directory (3E-8); tests must not write into the repo root.
+let __cwdDir: string;
+const __originalCwd = process.cwd();
+before(() => {
+  __cwdDir = mkdtempSync(join(tmpdir(), "cutcli-markdown-test-"));
+  process.chdir(__cwdDir);
+});
+after(() => {
+  process.chdir(__originalCwd);
+  try { rmSync(__cwdDir, { recursive: true, force: true }); } catch {}
+});
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
