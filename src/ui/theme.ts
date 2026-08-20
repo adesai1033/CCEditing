@@ -32,22 +32,25 @@ export type Role =
 
 type Palette = Record<Role, string>;
 
+// Sleek-professional palette (3K.1), inspired by Claude Code's terminal look:
+// default-foreground prose, gray chrome, ONE warm terracotta accent, and
+// muted status colors. No saturated neon anywhere.
 const RICH: Palette = {
-  accent:   "#22d3ee",
-  success:  "#4ade80",
-  warning:  "#fbbf24",
-  danger:   "#f87171",
-  info:     "#93c5fd",
-  inFlight: "#22d3ee",
+  accent:   "#d97757",
+  success:  "#8fb88f",
+  warning:  "#d9a860",
+  danger:   "#cc7a7a",
+  info:     "#8fa3b8",
+  inFlight: "#d97757",
 };
 
 const BASIC: Palette = {
-  accent:   "cyan",
+  accent:   "yellow",
   success:  "green",
   warning:  "yellow",
   danger:   "red",
   info:     "blue",
-  inFlight: "cyan",
+  inFlight: "yellow",
 };
 
 /** chalk's detected color depth: 0 none, 1 ANSI-16, 2 ANSI-256, 3 truecolor. */
@@ -114,7 +117,7 @@ export const ui = {
   muted:           { dimColor: true },
   emphasis:        { bold: true },
   heading:         { color: palette.accent, bold: true },
-  prompt:          { color: palette.success, bold: true },
+  prompt:          { color: palette.accent, bold: true },
   key:             { color: palette.accent, bold: true },
   thinking:        { dimColor: true, italic: true },
   successEmphasis: { color: palette.success, bold: true },
@@ -122,10 +125,11 @@ export const ui = {
   dangerEmphasis:  { color: palette.danger, bold: true },
 } satisfies Record<string, TextRoleStyle>;
 
-/** Border prop bags for Ink <Box>. */
+/** Border prop bags for Ink <Box>. Chrome is gray and quiet; the confirm gate
+ *  is the one bordered moment that carries color. */
 export const panels = {
-  header:  { borderStyle: "round" as const, borderColor: palette.accent },
-  input:   { borderStyle: "round" as const, borderColor: palette.accent },
+  header:  { borderStyle: "round" as const, borderColor: "gray" },
+  input:   { borderStyle: "round" as const, borderColor: "gray" },
   gate:    { borderStyle: "round" as const, borderColor: palette.warning },
   waiting: { borderStyle: "round" as const, borderColor: "gray" },
 };
@@ -160,11 +164,11 @@ export const paint = {
   successEmphasis: styler(palette.success, { bold: true }),
 };
 
-// The clip-color cycle for the timeline bar. Same rotation as always, sourced
-// from the palette tier so it degrades with everything else.
+// The clip-color cycle for the timeline bar: adjacent clips must read as
+// distinct, but in muted tones — terracotta, slate, sage, sand.
 const CLIP_CYCLE = chalk.level >= 2
-  ? ["#22d3ee", "#fbbf24", "#e879f9", "#4ade80"]
-  : ["cyan", "yellow", "magenta", "green"];
+  ? ["#d97757", "#7c96b8", "#8fb88f", "#c2a878"]
+  : ["yellow", "blue", "green", "cyan"];
 
 const clipStylers = CLIP_CYCLE.map((c) => styler(c));
 

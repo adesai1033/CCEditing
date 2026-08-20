@@ -279,8 +279,13 @@ export function App() {
       input: trimmed,
       // Agent prose renders through the markdown seam; slash output passes
       // through untouched (3I.5 fix — no raw markdown reaches the terminal).
-      output: presentOutput(result.output, result.markdown === true),
+      // A timeline activation commits only a hint — the timeline itself is the
+      // LIVE panel below, not a scrollback copy (3K.1).
+      output: result.activatesTimeline
+        ? "(timeline open — ←→ scroll, ↑↓ zoom, type to close)"
+        : presentOutput(result.output, result.markdown === true),
       isError: result.isError,
+      dim: result.activatesTimeline === true,
     }]);
 
     if (result.newState) setReplState(result.newState);
@@ -339,23 +344,18 @@ export function App() {
     return clipsInOrder(state.session.state.timeline).reduce((s, c) => s + (c.outPoint - c.inPoint), 0);
   }
 
+  // Scroll/zoom update the viewport IN PLACE (3K.1): the timeline renders as a
+  // live panel while timeline mode is active, so arrow keys re-render one
+  // region instead of committing a fresh copy into the append-only scrollback
+  // per keypress (which is what stacked duplicate timelines before).
   function handleViewportZoom(dir: "in" | "out"): void {
     if (!timelineActive || !replState.session) return;
     const total = totalDuration(replState);
     const cur = viewport ?? { startTime: 0, viewDuration: total };
-    const newViewport: ViewportState = {
+    setViewport({
       ...cur,
       viewDuration: Math.max(1, cur.viewDuration * (dir === "in" ? 0.667 : 1.5)),
-    };
-    setViewport(newViewport);
-    const rendered = renderTimeline(replState.session.state, process.stdout.columns, newViewport)
-      + "\n" + renderClipList(replState.session.state);
-    setEntries((prev) => [...prev, {
-      id: crypto.randomUUID(),
-      input: `(zoom ${dir})`,
-      output: rendered,
-      isError: false,
-    }]);
+    });
   }
 
   function handleViewportScroll(dir: "left" | "right"): void {
@@ -363,19 +363,10 @@ export function App() {
     const total = totalDuration(replState);
     const cur = viewport ?? { startTime: 0, viewDuration: total };
     const delta = cur.viewDuration * 0.2 * (dir === "right" ? 1 : -1);
-    const newViewport: ViewportState = {
+    setViewport({
       ...cur,
       startTime: Math.max(0, cur.startTime + delta),
-    };
-    setViewport(newViewport);
-    const rendered = renderTimeline(replState.session.state, process.stdout.columns, newViewport)
-      + "\n" + renderClipList(replState.session.state);
-    setEntries((prev) => [...prev, {
-      id: crypto.randomUUID(),
-      input: `(scroll ${dir})`,
-      output: rendered,
-      isError: false,
-    }]);
+    });
   }
 
   return (
@@ -383,6 +374,9 @@ export function App() {
       <Header />
       <OutputHistory entries={entries} pendingEntry={pendingEntry} />
       {expanded && <TurnDetailPanel details={turnDetails} />}
+      {timelineActive && replState.session && (
+        <TimelinePanel state={replState.session.state} viewport={viewport} />
+      )}
       {liveTurn && <LiveTurnView turn={liveTurn} scoutLabel={scoutLabel} frame={spinner} />}
       {pendingPlan && <ConfirmPlan plan={pendingPlan} />}
       {pendingPlan && previewStatus && (
@@ -497,6 +491,26 @@ function LiveTurnView({ turn, scoutLabel, frame }: {
 /** Friendlier tool labels for the live rows; never the raw input JSON. */
 function displayToolName(name: string): string {
   return name === "propose_edit_plan" ? "preparing plan" : name.replace(/_/g, " ");
+}
+
+// ── Live timeline panel (3K.1) ───────────────────────────────────────────────
+//
+// While timeline mode is active, the timeline is ONE region that re-renders in
+// place as the viewport moves — never a per-keypress scrollback commit. Width
+// leaves room for the panel's own padding so the box edge never wraps.
+
+function TimelinePanel({ state, viewport }: {
+  state: import("../project/types.js").ProjectState;
+  viewport: ViewportState | null;
+}) {
+  const width = Math.max(40, (process.stdout.columns ?? 80) - 4);
+  const rendered = renderTimeline(state, width, viewport ?? undefined)
+    + "\n" + renderClipList(state);
+  return (
+    <Box flexDirection="column" paddingX={1}>
+      <Text>{rendered}</Text>
+    </Box>
+  );
 }
 
 // ── Ctrl+R tool-detail panel (3K) ────────────────────────────────────────────
