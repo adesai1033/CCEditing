@@ -425,3 +425,49 @@ describe("AnthropicProvider — stream()", () => {
     assert.equal(res.stopReason, "end_turn");
   });
 });
+
+// ── Prompt caching (3E-5) ─────────────────────────────────────────────────────
+
+describe("AnthropicProvider — prompt caching", () => {
+  test("system segments map to text blocks with cache_control on the cacheable one only", async () => {
+    const { client, lastParams } = capturingClient(anthropicMessage([{ type: "text", text: "ok", citations: null }], "end_turn"));
+    const provider = new AnthropicProvider({ model: MODEL_DEFAULT, client });
+
+    await provider.send({
+      ...baseRequest([]),
+      system: [
+        { text: "STATIC INSTRUCTIONS", cacheable: true },
+        { text: "VOLATILE SNAPSHOT" },
+      ],
+    });
+
+    const sys = lastParams().system as any[];
+    assert.equal(sys.length, 2);
+    // The breakpoint sits on the static block — caching the prefix up to and
+    // including it (which covers the tools array per vendor prefix ordering).
+    assert.deepEqual(sys[0], { type: "text", text: "STATIC INSTRUCTIONS", cache_control: { type: "ephemeral" } });
+    // The volatile block carries NO cache_control — it must stay outside the cache.
+    assert.deepEqual(sys[1], { type: "text", text: "VOLATILE SNAPSHOT" });
+    // Tools are present ahead of system in the request (inside the cached prefix).
+    assert.equal(lastParams().tools?.length, 1);
+  });
+
+  test("a plain-string system passes through untouched (no cache_control)", async () => {
+    const { client, lastParams } = capturingClient(anthropicMessage([{ type: "text", text: "ok", citations: null }], "end_turn"));
+    const provider = new AnthropicProvider({ model: MODEL_DEFAULT, client });
+    await provider.send(baseRequest([]));
+    assert.equal(lastParams().system, "You are an editor.");
+  });
+
+  test("cache usage fields normalize into neutral usage", async () => {
+    const { client } = capturingClient(anthropicMessage(
+      [{ type: "text", text: "ok", citations: null }],
+      "end_turn",
+      { input_tokens: 50, output_tokens: 10, cache_read_input_tokens: 2048, cache_creation_input_tokens: 0 } as any,
+    ));
+    const provider = new AnthropicProvider({ model: MODEL_DEFAULT, client });
+    const res = await provider.send(baseRequest([]));
+    assert.equal(res.usage.cacheReadTokens, 2048);
+    assert.equal(res.usage.cacheCreationTokens, 0);
+  });
+});

@@ -65,8 +65,22 @@ export interface ReasoningConfig {
   effort?: ReasoningEffort;
 }
 
+/**
+ * One segment of the system prompt (3E-5). `cacheable: true` marks the end of a
+ * stable prefix the provider may cache — the segment (and everything before it,
+ * including tool schemas) must be byte-identical across requests to hit cache.
+ * Volatile content (state snapshots) goes in later, non-cacheable segments.
+ * How caching is realized is the provider's concern (Anthropic: cache_control
+ * breakpoints); nothing vendor-shaped appears here.
+ */
+export interface SystemSegment {
+  text: string;
+  cacheable?: boolean;
+}
+
 export interface ChatRequest {
-  system: string;
+  /** Plain string (uncached) or ordered segments with an optional cacheable prefix. */
+  system: string | SystemSegment[];
   messages: NeutralMessage[];
   /** The registry's neutral tool schemas; the provider translates them. */
   tools: ToolSchema[];
@@ -91,6 +105,10 @@ export interface ChatResponse {
     outputTokens: number;
     /** Normalized reasoning-token count when the vendor reports one. */
     reasoningTokens?: number;
+    /** Prompt-cache activity when the vendor reports it (3E-5). Consumed by
+     * telemetry (3E-9); also how a live smoke proves caching actually fired. */
+    cacheReadTokens?: number;
+    cacheCreationTokens?: number;
   };
 }
 

@@ -121,7 +121,12 @@ export async function runScout(sourceId: string, state: ProjectState, deps: Scou
 
   const allowed = new Set(deps.registry.perceptionSchemas().map((s) => s.name));
   const tools = [...deps.registry.perceptionSchemas(), recordFindingsSchema];
-  const system = buildScoutPrompt(source);
+  // Static instructions cacheable (shared byte-identical across all N scouts
+  // in a survey); the per-source identification segment follows uncached.
+  const system = [
+    { text: scoutStaticPrefix(), cacheable: true },
+    { text: scoutSourceSegment(source) },
+  ];
 
   let running = state;
   let messages: NeutralMessage[] = [
@@ -224,13 +229,15 @@ function writeContribution(state: ProjectState, sourceId: string, contribution: 
   };
 }
 
-function buildScoutPrompt(source: SourceFile): string {
-  const hasAudio = source.audioCodec !== null && source.audioCodec !== undefined;
+/**
+ * The scout system prompt, split for prompt caching (3E-5): the instructions
+ * are identical for every scout, so N parallel scouts in one survey share one
+ * cached prefix (instructions + the perception tool schemas); only the
+ * source-identification segment varies per scout.
+ */
+export function scoutStaticPrefix(): string {
   return [
     "You are a read-only scout. Your job is to perceive ONE source video and distill it into a compact map — nothing else.",
-    "",
-    `Source: ${source.id}`,
-    `File: ${source.fileName}  ·  ${source.duration.toFixed(1)}s  ·  ${source.width}x${source.height}  ·  audio: ${hasAudio ? "yes" : "no"}`,
     "",
     "Use the perception tools to look at this source. Reuse cached results — do not re-request perception you already have. Then call record_findings ONCE with:",
     "- outline: a short beat-by-beat map (a handful of segments across the whole source, not every second).",
@@ -239,5 +246,13 @@ function buildScoutPrompt(source: SourceFile): string {
     "- silences (if relevant): notable pauses.",
     "",
     "Keep every gist to one terse phrase. Do NOT dump raw transcripts or exhaustive scene lists — distill. You cannot edit the timeline; you only perceive and report. You have a limited tool-call budget, so be economical, then record_findings.",
+  ].join("\n");
+}
+
+function scoutSourceSegment(source: SourceFile): string {
+  const hasAudio = source.audioCodec !== null && source.audioCodec !== undefined;
+  return [
+    `Source: ${source.id}`,
+    `File: ${source.fileName}  ·  ${source.duration.toFixed(1)}s  ·  ${source.width}x${source.height}  ·  audio: ${hasAudio ? "yes" : "no"}`,
   ].join("\n");
 }

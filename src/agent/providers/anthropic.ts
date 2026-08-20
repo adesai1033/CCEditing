@@ -123,7 +123,7 @@ export class AnthropicProvider implements ChatProvider {
   private buildParams(request: ChatRequest): Anthropic.Messages.MessageCreateParamsNonStreaming {
     const params: Anthropic.Messages.MessageCreateParamsNonStreaming = {
       model: this.model,
-      system: request.system,
+      system: toAnthropicSystem(request.system),
       messages: request.messages.map(toAnthropicMessage),
       tools: request.tools.map(toAnthropicTool),
       max_tokens: request.maxTokens,
@@ -149,6 +149,26 @@ export class AnthropicProvider implements ChatProvider {
 }
 
 // ── Neutral → Anthropic (request) ──────────────────────────────────────────────
+
+/**
+ * Neutral system → Anthropic system. Plain strings pass through untouched.
+ * Segments become text blocks; a `cacheable` segment gets a `cache_control`
+ * breakpoint, which caches the whole prefix up to and including that block —
+ * the tools array included, since the vendor prefix order is tools → system →
+ * messages. (Prefixes below the model's minimum cacheable length are silently
+ * not cached; sonnet-4-6's minimum is 1024 tokens, and our static prefix plus
+ * tool schemas clears it.)
+ */
+function toAnthropicSystem(
+  system: ChatRequest["system"],
+): string | Anthropic.Messages.TextBlockParam[] {
+  if (typeof system === "string") return system;
+  return system.map((seg) => ({
+    type: "text",
+    text: seg.text,
+    ...(seg.cacheable ? { cache_control: { type: "ephemeral" as const } } : {}),
+  }));
+}
 
 function toAnthropicMessage(m: NeutralMessage): Anthropic.Messages.MessageParam {
   return {
@@ -200,6 +220,12 @@ function toNeutralResponse(response: Anthropic.Messages.Message): ChatResponse {
       outputTokens: response.usage.output_tokens,
       ...(response.usage.output_tokens_details?.thinking_tokens != null
         ? { reasoningTokens: response.usage.output_tokens_details.thinking_tokens }
+        : {}),
+      ...(response.usage.cache_read_input_tokens != null
+        ? { cacheReadTokens: response.usage.cache_read_input_tokens }
+        : {}),
+      ...(response.usage.cache_creation_input_tokens != null
+        ? { cacheCreationTokens: response.usage.cache_creation_input_tokens }
         : {}),
     },
   };

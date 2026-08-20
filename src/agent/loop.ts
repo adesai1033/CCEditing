@@ -1,6 +1,6 @@
 import type { ProjectSession } from "../project/session.js";
 import { applyPlan } from "../project/session.js";
-import { buildSystemPrompt } from "./prompt.js";
+import { staticSystemPrefix, stateSnapshotSegment } from "./prompt.js";
 import { buildDefaultRegistry, type ToolRegistry } from "./registry.js";
 import { buildDefaultProvider } from "./providers/default.js";
 import type {
@@ -95,7 +95,15 @@ export async function runAgent(input: AgentInput): Promise<AgentResult> {
     assistantText: [],
   };
 
-  const system = await buildSystemPrompt(state.session.state);
+  // System prompt in two segments (3E-5): the static prefix is cacheable —
+  // byte-identical every turn, so the provider can cache it (plus the tool
+  // schemas ahead of it); the fresh timeline snapshot follows OUTSIDE the
+  // cached prefix so state changes never invalidate it. Same effective
+  // instructions as the pre-split prompt.
+  const system = [
+    { text: staticSystemPrefix(), cacheable: true },
+    { text: await stateSnapshotSegment(state.session.state) },
+  ];
   const tools = registry.allSchemas();
 
   for (let i = 0; i < MAX_TOOL_CALLS_PER_TURN + 1; i++) {

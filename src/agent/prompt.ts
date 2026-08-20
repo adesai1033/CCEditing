@@ -2,19 +2,23 @@ import type { ProjectState } from "../project/types.js";
 import { queryTimeline } from "./tools/query_timeline.js";
 
 /**
- * Build the system prompt for the agent loop. Embeds a fresh timeline
- * snapshot so the agent doesn't have to call query_timeline for trivial
- * cases. Stays under ~1500 tokens — concrete instructions, not philosophy.
+ * The system prompt is split for prompt caching (3E-5):
  *
- * The verification section is load-bearing for editing quality — do not
- * trim it to a single clause.
+ *  - `staticSystemPrefix()` — instructions that never vary per turn. This is
+ *    the cacheable segment; the loop marks it `cacheable` and the provider
+ *    places the cache breakpoint after it (which also covers the tools array,
+ *    since the vendor prefix order is tools → system → messages). It MUST stay
+ *    byte-identical across turns — do not interpolate anything stateful here.
+ *
+ *  - `stateSnapshotSegment(state)` — the fresh timeline snapshot, volatile by
+ *    design. It sits AFTER the breakpoint so a timeline change never
+ *    invalidates the cached prefix.
+ *
+ * The effective instruction set (static + volatile concatenated) is the same
+ * content the pre-split prompt carried. The verification section is
+ * load-bearing for editing quality — do not trim it to a single clause.
  */
-export async function buildSystemPrompt(state: ProjectState): Promise<string> {
-  const snapshot = await queryTimeline.execute(state, {});
-  const snapshotJson = snapshot.ok
-    ? JSON.stringify(snapshot.result, null, 2)
-    : "(timeline unavailable)";
-
+export function staticSystemPrefix(): string {
   return [
     "You are CutCLI's editing agent. The user describes edits in natural language; you propose precise edit plans.",
     "",
@@ -70,7 +74,21 @@ export async function buildSystemPrompt(state: ProjectState): Promise<string> {
     "- When you're confident AND you have verified the ranges, call propose_edit_plan exactly once.",
     "- Do not write plans inline as text; the propose_edit_plan tool is the only way to apply changes.",
     "- A rejected plan comes back as a tool result; you may revise and re-propose, or apologize and stop.",
-    "",
+  ].join("\n");
+}
+
+/**
+ * The volatile system segment: a fresh timeline snapshot each turn so the agent
+ * doesn't call query_timeline for trivial cases. Changes whenever project state
+ * changes — which is exactly why it lives outside the cached prefix.
+ */
+export async function stateSnapshotSegment(state: ProjectState): Promise<string> {
+  const snapshot = await queryTimeline.execute(state, {});
+  const snapshotJson = snapshot.ok
+    ? JSON.stringify(snapshot.result, null, 2)
+    : "(timeline unavailable)";
+
+  return [
     "## Current timeline state",
     "This snapshot is fresh as of this turn. Use it as the source of truth; only call query_timeline if you need to confirm something specific.",
     "```json",
