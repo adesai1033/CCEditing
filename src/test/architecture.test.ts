@@ -46,16 +46,20 @@ describe("architecture guard", () => {
     assert.deepEqual(offenders, [], `src/agent/ must not import from src/repl/`);
   });
 
-  // 3E-3 write invariant: the scout path is read-only. Nothing a scout can reach
-  // may import or call the write chokepoint. Enforced structurally here so a
-  // future edit can't quietly hand a scout the ability to mutate the timeline.
-  test("the scout path imports no write functions (applyPlan / propose_edit_plan)", () => {
+  // 3E-3 write invariant, extended by 3G: the scout path AND the critic path
+  // are read-only. Nothing a scout or the critic can reach may import or call
+  // the write chokepoint. Enforced structurally here so a future edit can't
+  // quietly hand either the ability to mutate the timeline — the critic judges,
+  // the director alone writes.
+  test("the scout and critic paths import no write functions (applyPlan / propose_edit_plan)", () => {
     const scoutPath = [
       join(AGENT_DIR, "scout.ts"),
       join(AGENT_DIR, "content-map.ts"),
       join(AGENT_DIR, "perception-registry.ts"),
       join(AGENT_DIR, "indexing.ts"),
       join(AGENT_DIR, "tools", "survey_sources.ts"),
+      join(AGENT_DIR, "critic.ts"),
+      join(AGENT_DIR, "critic-prompt.ts"),
     ];
     const offenders: string[] = [];
     // Match imports of applyPlan, propose_edit_plan module, or the session write API.

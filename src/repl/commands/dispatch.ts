@@ -28,6 +28,9 @@ export interface ReplState {
   session: ProjectSession | null;
   messages: NeutralMessage[];
   autoApprove: boolean;
+  /** 3G: critic review of compound plans. Optional so existing state literals
+   *  stay valid; undefined means ON (the default). */
+  criticEnabled?: boolean;
 }
 
 export interface DispatchResult {
@@ -84,6 +87,7 @@ export async function dispatch(
     case "redo":     return withSlashContinuity(await dispatchRedo(state), state);
     case "export":   return dispatchExport(args, state);
     case "auto":     return dispatchAuto(args, state);
+    case "critic":   return dispatchCritic(args, state);
     case "clear":    return dispatchClear(state);
     default:         return { output: `Unknown command: /${cmd}. Type /help for available commands.`, isError: true };
   }
@@ -527,6 +531,39 @@ function dispatchAuto(args: string[], state: ReplState): DispatchResult {
   return { output: "Usage: /auto [on|off]", isError: true };
 }
 
+// ── /critic ───────────────────────────────────────────────────────────────────
+//
+// Toggle for the 3G plan-review pass. Default ON. Not a project-state mutation —
+// no synthetic continuity message, no undo entry. Exists so the critic's value
+// can be A/B'd (/critic off should reproduce pre-slice behavior exactly) and
+// skipped when iterating quickly.
+
+function dispatchCritic(args: string[], state: ReplState): DispatchResult {
+  const on = state.criticEnabled !== false;
+  const arg = args[0]?.toLowerCase();
+  if (!arg || arg === "status") {
+    return {
+      output: `Critic review is ${on ? "on" : "off"}. Use /critic on or /critic off to toggle.`,
+      isError: false,
+    };
+  }
+  if (arg === "on") {
+    return {
+      output: "Critic review: on. Compound plans get a fresh-eyes review before confirmation.",
+      isError: false,
+      newState: { ...state, criticEnabled: true },
+    };
+  }
+  if (arg === "off") {
+    return {
+      output: "Critic review: off. Plans go straight to confirmation.",
+      isError: false,
+      newState: { ...state, criticEnabled: false },
+    };
+  }
+  return { output: "Usage: /critic [on|off|status]", isError: true };
+}
+
 // ── /clear ────────────────────────────────────────────────────────────────────
 
 function dispatchClear(state: ReplState): DispatchResult {
@@ -557,6 +594,7 @@ async function dispatchAgent(
     session: state.session,
     messages: state.messages,
     autoApprove: state.autoApprove,
+    criticEnabled: state.criticEnabled !== false,
     confirm: options.confirm,
     onProgress: options.onAgentProgress,
   });

@@ -9,6 +9,7 @@ import {
 import type { ProjectState } from "../project/types.js";
 import { clipsInOrder, getClipDisplayRefs } from "../project/types.js";
 import type { ToolSchema } from "./types.js";
+import type { CriticConcern } from "./critic.js";
 
 // The agent's operation vocabulary is a structural subset of session.ts's
 // Operation: everything except addSource. File imports stay under /open.
@@ -67,6 +68,10 @@ export interface PlanForConfirmation {
   summary: string;
   operations: Operation[];
   renderedLines: string[];
+  /** 3G: critic concerns still outstanding when the revision cap (or the tool
+   *  budget) was exhausted. Shown at the confirm gate so the user arbitrates
+   *  with the flags visible. Absent on approved / unreviewed plans. */
+  outstandingConcerns?: CriticConcern[];
 }
 
 /**

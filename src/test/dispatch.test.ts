@@ -574,3 +574,59 @@ describe("v4 migration", () => {
     assert.equal(clipsInOrder(session.state.timeline)[0]!.userLabel, undefined);
   });
 });
+
+// ── /critic (3G) ──────────────────────────────────────────────────────────────
+
+describe("/critic", () => {
+  test("default is on; bare /critic and /critic status report it", async () => {
+    const r = await dispatch("/critic", makeState());
+    assert.equal(r.isError, false);
+    assert.match(r.output, /Critic review is on/);
+    assert.equal(r.newState, undefined, "status is read-only");
+
+    const s = await dispatch("/critic status", makeState());
+    assert.equal(s.isError, false);
+    assert.match(s.output, /is on/);
+  });
+
+  test("/critic off then /critic on toggles the flag", async () => {
+    const off = await dispatch("/critic off", makeState());
+    assert.equal(off.isError, false);
+    assert.equal(off.newState!.criticEnabled, false);
+    assert.match(off.output, /off/);
+
+    const status = await dispatch("/critic status", off.newState!);
+    assert.match(status.output, /Critic review is off/);
+
+    const on = await dispatch("/critic on", off.newState!);
+    assert.equal(on.isError, false);
+    assert.equal(on.newState!.criticEnabled, true);
+  });
+
+  test("/critic with unknown arg returns usage error", async () => {
+    const r = await dispatch("/critic maybe", makeState());
+    assert.equal(r.isError, true);
+    assert.match(r.output, /Usage/);
+  });
+
+  test("the toggle reaches the agent: dispatchAgent passes criticEnabled through", async () => {
+    let captured: boolean | undefined;
+    const mockAgent = async (input: import("../agent/loop.js").AgentInput) => {
+      captured = input.criticEnabled;
+      return { messages: input.messages, session: input.session, output: "(mocked)", isError: false };
+    };
+
+    // Default (field unset) → on.
+    await dispatch("hi", makeState(), { confirm: async () => ({ approved: true }), agent: mockAgent });
+    assert.equal(captured, true);
+
+    // Toggled off → off.
+    await dispatch("hi", { ...makeState(), criticEnabled: false }, { confirm: async () => ({ approved: true }), agent: mockAgent });
+    assert.equal(captured, false);
+  });
+
+  test("/help lists /critic", async () => {
+    const r = await dispatch("/help", noProject);
+    assert.match(r.output, /\/critic \[on\|off\]/);
+  });
+});

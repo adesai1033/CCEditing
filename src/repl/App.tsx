@@ -19,13 +19,15 @@ import type { ProgressEvent } from "../agent/loop.js";
 // final output is committed once, so nothing double-renders.
 interface LiveTool { key: string; name: string; done: boolean; ok: boolean; }
 interface LiveScout { sourceId: string; status: "started" | "completed" | "failed"; }
+interface LiveCritic { key: string; done: boolean; verdict?: "approve" | "revise"; concerns: number; }
 interface LiveTurn {
   text: string;
   thinking: string;
   tools: LiveTool[];
   scouts: LiveScout[];
+  critic: LiveCritic[];
 }
-const EMPTY_TURN: LiveTurn = { text: "", thinking: "", tools: [], scouts: [] };
+const EMPTY_TURN: LiveTurn = { text: "", thinking: "", tools: [], scouts: [], critic: [] };
 
 export function App() {
   const [entries, setEntries]               = useState<HistoryEntry[]>([]);
@@ -33,6 +35,7 @@ export function App() {
     session: null,
     messages: [],
     autoApprove: false,
+    criticEnabled: true,
   });
   const [inputValue, setInputValue]         = useState<string>("");
   const [viewport, setViewport]             = useState<ViewportState | null>(null);
@@ -126,6 +129,19 @@ export function App() {
           if (idx >= 0) scouts[idx] = { sourceId: event.sourceId, status: event.status };
           else scouts.push({ sourceId: event.sourceId, status: event.status });
           return { ...t, scouts };
+        }
+        case "critic_start":
+          return { ...t, critic: [...t.critic, { key: crypto.randomUUID(), done: false, concerns: 0 }] };
+        case "critic_verdict": {
+          // Resolve the most recent still-open review line with its verdict.
+          const critic = [...t.critic];
+          for (let i = critic.length - 1; i >= 0; i--) {
+            if (!critic[i]!.done) {
+              critic[i] = { ...critic[i]!, done: true, verdict: event.verdict, concerns: event.concerns };
+              break;
+            }
+          }
+          return { ...t, critic };
         }
         default:
           return t;
@@ -273,6 +289,15 @@ function LiveTurnView({ turn, scoutLabel }: { turn: LiveTurn; scoutLabel: (id: s
           {t.name === "propose_edit_plan"
             ? `→ preparing plan…${t.done ? " done" : ""}`
             : `→ ${t.name}${t.done ? (t.ok ? " ✓" : " ✗") : "…"}`}
+        </Text>
+      ))}
+      {/* Critic passes (3G): a dim line per review; a revise verdict notes the
+          concern count, an approve resolves quietly. */}
+      {turn.critic.map((c) => (
+        <Text key={c.key} dimColor>
+          {c.done && c.verdict === "revise"
+            ? `✻ reviewing plan…  → revised (${c.concerns} concern${c.concerns === 1 ? "" : "s"})`
+            : `✻ reviewing plan…${c.done ? " ✓" : ""}`}
         </Text>
       ))}
       {/* Thinking summary streams in, dim and distinct. */}

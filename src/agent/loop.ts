@@ -15,8 +15,20 @@ import {
   renderPlanForConfirmation,
   type PlanForConfirmation,
 } from "./propose_edit_plan.js";
+import { runCritic, type CriticInput, type CriticVerdict } from "./critic.js";
+import type { ContentMap } from "./content-map.js";
 
 const MAX_TOOL_CALLS_PER_TURN = 25;
+// ── Critic thresholds (3G) ────────────────────────────────────────────────────
+// Only compound plans get a critic pass: a plan with at least this many ops is
+// always reviewed, and a smaller multi-op plan is reviewed when it followed a
+// survey_sources call (the tell that the turn was a narrative edit). Single-op
+// edits are NEVER reviewed — a critic pass there is pure latency and cost.
+export const CRITIC_MIN_OPS = 3;
+// Bounded revision cycle: draft → review → (revise → review) up to this many
+// times → stop. On exhaustion the plan is presented WITH the outstanding
+// concerns attached rather than looping or failing — the user is the arbiter.
+export const MAX_CRITIC_REVISIONS = 2;
 // Thinking tokens count toward the output budget. At 4096, reasoning on a hard
 // request eats the budget and truncates the plan mid-response. Sized to leave
 // room for both the reasoning and the answer. Provider-agnostic.
@@ -37,7 +49,11 @@ export type ProgressEvent =
   | { type: "text_delta"; text: string }
   | { type: "thinking_delta"; text: string }
   | { type: "tool_use_start"; name: string }
-  | { type: "scout"; sourceId: string; status: "started" | "completed" | "failed" };
+  | { type: "scout"; sourceId: string; status: "started" | "completed" | "failed" }
+  // Critic pass lifecycle (3G): start when a drafted plan goes to review,
+  // verdict when it comes back. The REPL renders these as a dim line.
+  | { type: "critic_start" }
+  | { type: "critic_verdict"; verdict: "approve" | "revise"; concerns: number };
 
 export interface AgentInput {
   userPrompt: string;
@@ -51,6 +67,11 @@ export interface AgentInput {
   provider?: ChatProvider;
   // Injected for tests. Defaults to buildDefaultRegistry().
   registry?: ToolRegistry;
+  // 3G: the /critic toggle. Undefined means ON — compound plans are reviewed
+  // by a fresh context before the user sees them; false skips the pass.
+  criticEnabled?: boolean;
+  // Injected for tests. Defaults to runCritic through this turn's provider.
+  critic?: (input: CriticInput) => Promise<CriticVerdict>;
 }
 
 export interface AgentResult {
@@ -73,13 +94,21 @@ interface AgentState {
   rejected: boolean;             // set when a plan was rejected
   applyError: string | null;     // set when applyPlan failed mid-plan
   assistantText: string[];       // accumulated text replies for the final output summary
+  surveyed: boolean;             // 3G: survey_sources ran this turn (critic threshold input)
+  lastContentMap: ContentMap | null; // 3G: the most recent survey's map, handed to the critic
+  criticRevisions: number;       // 3G: revision rounds consumed (capped at MAX_CRITIC_REVISIONS)
 }
+
+type CriticFn = (input: CriticInput) => Promise<CriticVerdict>;
 
 // ── Entrypoint ────────────────────────────────────────────────────────────────
 
 export async function runAgent(input: AgentInput): Promise<AgentResult> {
   const provider = input.provider ?? buildDefaultProvider();
   const registry = input.registry ?? buildDefaultRegistry();
+  // The critic goes through the same ChatProvider seam as the director
+  // (decision 7); it just builds its own fresh message list inside runCritic.
+  const critic: CriticFn = input.critic ?? ((ci) => runCritic(ci, { provider }));
 
   let state: AgentState = {
     messages: [
@@ -93,6 +122,9 @@ export async function runAgent(input: AgentInput): Promise<AgentResult> {
     rejected: false,
     applyError: null,
     assistantText: [],
+    surveyed: false,
+    lastContentMap: null,
+    criticRevisions: 0,
   };
 
   // System prompt in two segments (3E-5): the static prefix is cacheable —
@@ -199,7 +231,7 @@ export async function runAgent(input: AgentInput): Promise<AgentResult> {
       }
       state.toolBudget -= 1;
 
-      const handled = await dispatchToolUse(tu, state, registry, input);
+      const handled = await dispatchToolUse(tu, state, registry, input, critic);
       state = handled.state;
       toolResults.push(handled.result);
       if (handled.stopAfterThisRound) stopAfterThisRound = true;
@@ -234,12 +266,13 @@ async function dispatchToolUse(
   state: AgentState,
   registry: ToolRegistry,
   input: AgentInput,
+  critic: CriticFn,
 ): Promise<ToolHandled> {
   const start = Date.now();
   input.onProgress?.({ type: "tool_call", name: tu.name, input: tu.input });
 
   if (tu.name === "propose_edit_plan") {
-    return handleProposePlan(tu, state, input, start);
+    return handleProposePlan(tu, state, input, critic, start);
   }
 
   const entry = registry.get(tu.name);
@@ -296,8 +329,15 @@ async function dispatchToolUse(
 
   input.onProgress?.({ type: "tool_result", name: tu.name, ok: true, durationMs: Date.now() - start });
 
+  // 3G: remember that this turn surveyed, and hold the map for the critic —
+  // the critic sees the same distilled substrate the director planned against.
+  let nextState: AgentState = { ...state, session: nextSession };
+  if (tu.name === "survey_sources") {
+    nextState = { ...nextState, surveyed: true, lastContentMap: outcome.result as ContentMap };
+  }
+
   return {
-    state: { ...state, session: nextSession },
+    state: nextState,
     result: {
       type: "tool_result",
       toolUseId: tu.id,
@@ -313,6 +353,7 @@ async function handleProposePlan(
   tu: ToolUseBlock,
   state: AgentState,
   input: AgentInput,
+  critic: CriticFn,
   startMs: number,
 ): Promise<ToolHandled> {
   const parsed = ProposeEditPlanInputSchema.safeParse(tu.input);
@@ -349,7 +390,59 @@ async function handleProposePlan(
     }
   }
 
-  const plan = renderPlanForConfirmation(state.session.state, parsed.data);
+  let plan = renderPlanForConfirmation(state.session.state, parsed.data);
+
+  // ── Critic review, BEFORE the user sees the plan (3G, decision 1) ──────────
+  // On `revise`, the structured concerns go back to the director as a
+  // tool_result and this turn's loop continues — the director alone revises
+  // and re-proposes (decision 8); the critic never writes. Bounded by
+  // MAX_CRITIC_REVISIONS and the per-turn tool budget; on exhaustion the plan
+  // is presented WITH the outstanding concerns rather than looping or failing.
+  if (input.criticEnabled !== false && planNeedsReview(parsed.data.operations.length, state.surveyed)) {
+    input.onProgress?.({ type: "critic_start" });
+    let review: CriticVerdict;
+    try {
+      review = await critic({
+        userRequest: lastUserPromptFrom(state.messages),
+        contentMap: state.lastContentMap,
+        plan: { summary: parsed.data.summary, operations: parsed.data.operations },
+        renderedPlan: plan.renderedLines,
+        timelineState: state.session.state,
+      });
+    } catch {
+      // runCritic itself fails open, but an injected critic may throw — a
+      // critic failure must never strand a valid plan.
+      review = { verdict: "approve", concerns: [] };
+    }
+    input.onProgress?.({ type: "critic_verdict", verdict: review.verdict, concerns: review.concerns.length });
+
+    if (review.verdict === "revise") {
+      // A revision round needs budget for the director's re-proposal; if the
+      // cap or the budget is exhausted, stop revising and present instead.
+      if (state.criticRevisions < MAX_CRITIC_REVISIONS && state.toolBudget > 0) {
+        input.onProgress?.({ type: "tool_result", name: tu.name, ok: true, durationMs: Date.now() - startMs });
+        return {
+          state: { ...state, criticRevisions: state.criticRevisions + 1 },
+          result: {
+            type: "tool_result",
+            toolUseId: tu.id,
+            content: JSON.stringify({
+              status: "revise",
+              concerns: review.concerns,
+              instruction:
+                "A plan reviewer flagged these concerns before the user saw the plan. " +
+                "Revise the plan to address them and call propose_edit_plan again. " +
+                "Fix the plan; do not argue with the review.",
+            }),
+          },
+          stopAfterThisRound: false,
+        };
+      }
+      if (review.concerns.length > 0) {
+        plan = { ...plan, outstandingConcerns: review.concerns };
+      }
+    }
+  }
 
   // Confirm (unless auto-approve)
   let approved = true;
@@ -436,6 +529,16 @@ function finalize(state: AgentState, errorOverride: string | null, hadError: boo
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * The 3G review threshold. Single-op edits are never reviewed (pure latency);
+ * a plan with CRITIC_MIN_OPS or more always is; a smaller multi-op plan is
+ * reviewed when the turn surveyed sources — the tell of a narrative edit.
+ */
+function planNeedsReview(opsCount: number, surveyed: boolean): boolean {
+  if (opsCount < 2) return false;
+  return opsCount >= CRITIC_MIN_OPS || surveyed;
+}
 
 function lastUserPromptFrom(messages: NeutralMessage[]): string {
   // Walk backwards to find the most recent role=user message that is a genuine

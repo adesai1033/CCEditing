@@ -1,7 +1,9 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 
-import { runAgent } from "../agent/loop.js";
+import { runAgent, MAX_CRITIC_REVISIONS } from "../agent/loop.js";
+import type { CriticInput, CriticVerdict } from "../agent/critic.js";
+import type { PlanForConfirmation } from "../agent/propose_edit_plan.js";
 import type { ChatProvider, ChatResponse, ContentBlock } from "../agent/providers/types.js";
 import { buildDefaultRegistry } from "../agent/registry.js";
 import type { ToolSchema } from "../agent/types.js";
@@ -930,5 +932,296 @@ describe("runAgent — streaming", () => {
     assert.equal(r.session.undo.length, 1, "one undo entry for the applied plan");
     // The resumed turn streamed its text.
     assert.ok(events.filter((e) => e === "text_delta").length >= 1, "the post-approval turn streamed");
+  });
+});
+
+// ── Critic loop (3G) ──────────────────────────────────────────────────────────
+//
+// The critic reviews a drafted COMPOUND plan before the user sees it. These
+// tests inject the critic at the seam runAgent exposes (`critic`), so the
+// bounded cycle in the loop is what's exercised; the critic's own provider
+// interaction is tested in critic.test.ts. Decision 1's invariant recurs
+// throughout: confirm() fires exactly once per turn — draft-then-revision
+// churn never reaches the gate.
+
+function criticStub(verdicts: CriticVerdict[]) {
+  const calls: CriticInput[] = [];
+  let i = 0;
+  return {
+    calls,
+    critic: async (input: CriticInput): Promise<CriticVerdict> => {
+      calls.push(input);
+      return verdicts[Math.min(i++, verdicts.length - 1)]!;
+    },
+  };
+}
+
+// A compound (3-op) plan on the standard 120s clip. All ops reference the
+// original clip id, so they validate and apply in sequence.
+function compoundPlanOps(clipId: string, outPoint = 60, splitPoint = 20) {
+  return [
+    { type: "trim", clipId, inPoint: 0, outPoint },
+    { type: "split", clipId, splitPoint },
+    { type: "move", clipId, newIndex: 1 },
+  ];
+}
+
+const REVISE_ONCE: CriticVerdict = {
+  verdict: "revise",
+  concerns: [
+    { severity: "major", operationIndex: 1, issue: "Split lands mid-word; the map's silence boundary is at 30s." },
+    { severity: "minor", issue: "Resulting duration misses the stated target." },
+  ],
+};
+const APPROVE: CriticVerdict = { verdict: "approve", concerns: [] };
+
+describe("runAgent — critic (3G)", () => {
+  test("approve path: compound plan → critic approves → confirm once → applied as one undo entry", async () => {
+    const { session, clipId } = makeSession();
+    const provider = mockProvider([
+      toolUse("propose_edit_plan", { summary: "Tighten.", operations: compoundPlanOps(clipId) }, "tu_plan"),
+      endTurn("Done."),
+    ]);
+    const { critic, calls } = criticStub([APPROVE]);
+
+    let confirmCalls = 0;
+    const events: string[] = [];
+    const r = await runAgent({
+      userPrompt: "tighten this up",
+      session, messages: [], autoApprove: false,
+      confirm: async () => { confirmCalls++; return { approved: true }; },
+      onProgress: (e) => events.push(e.type),
+      provider, critic,
+    });
+
+    assert.equal(r.isError, false);
+    assert.equal(calls.length, 1, "the critic reviewed the draft once");
+    assert.equal(confirmCalls, 1, "confirm fired exactly once");
+    assert.equal(r.session.undo.length, 1, "one undo entry for the whole plan");
+    assert.equal(clipsInOrder(r.session.state.timeline).length, 2, "the split applied");
+    // The critic saw the request and the rendered plan — and got no survey map
+    // because none was taken this turn.
+    assert.equal(calls[0]!.userRequest, "tighten this up");
+    assert.equal(calls[0]!.renderedPlan.length, 3);
+    assert.equal(calls[0]!.contentMap, null);
+    // The pass surfaced on the progress channel.
+    assert.ok(events.includes("critic_start"));
+    assert.ok(events.includes("critic_verdict"));
+  });
+
+  test("revise path: concerns go back as a tool_result, the director re-proposes, the user confirms the REVISED plan once", async () => {
+    const { session, clipId } = makeSession();
+    const provider = mockProvider([
+      toolUse("propose_edit_plan", { summary: "Draft.", operations: compoundPlanOps(clipId, 50, 20) }, "tu_plan1"),
+      toolUse("propose_edit_plan", { summary: "Revised.", operations: compoundPlanOps(clipId, 60, 30) }, "tu_plan2"),
+      endTurn("Done."),
+    ]);
+    const { critic, calls } = criticStub([REVISE_ONCE, APPROVE]);
+
+    const confirmedPlans: PlanForConfirmation[] = [];
+    const r = await runAgent({
+      userPrompt: "tighten this up",
+      session, messages: [], autoApprove: false,
+      confirm: async (plan) => { confirmedPlans.push(plan); return { approved: true }; },
+      provider, critic,
+    });
+
+    assert.equal(r.isError, false);
+    assert.equal(calls.length, 2, "draft reviewed, then the revision reviewed");
+    assert.equal(confirmedPlans.length, 1, "confirm fired exactly once — no draft churn at the gate");
+    // The plan the user saw is the REVISED one.
+    assert.equal(confirmedPlans[0]!.summary, "Revised.");
+    assert.equal(confirmedPlans[0]!.outstandingConcerns, undefined, "an approved revision carries no concerns");
+    // The structured concerns went back to the director as a tool_result.
+    const feedback = r.messages
+      .filter((m) => m.role === "user")
+      .flatMap((m) => m.content)
+      .filter((b) => b.type === "tool_result")
+      .map((b) => String((b as { content: unknown }).content))
+      .find((c) => c.includes('"status":"revise"'));
+    assert.ok(feedback, "revise feedback present in history");
+    assert.match(feedback!, /mid-word/);
+    // The REVISED plan applied: split at 30 then move → first clip starts at 30.
+    assert.equal(clipsInOrder(r.session.state.timeline)[0]!.inPoint, 30);
+    assert.equal(r.session.undo.length, 1);
+  });
+
+  test("cap exhaustion: an always-revise critic gets exactly 2 revisions, then the plan is presented with concerns attached", async () => {
+    const { session, clipId } = makeSession();
+    const provider = mockProvider([
+      toolUse("propose_edit_plan", { summary: "Draft 1.", operations: compoundPlanOps(clipId, 50, 20) }, "tu_p1"),
+      toolUse("propose_edit_plan", { summary: "Draft 2.", operations: compoundPlanOps(clipId, 55, 25) }, "tu_p2"),
+      toolUse("propose_edit_plan", { summary: "Draft 3.", operations: compoundPlanOps(clipId, 45, 15) }, "tu_p3"),
+      endTurn("Done."),
+    ]);
+    const { critic, calls } = criticStub([REVISE_ONCE]); // revises forever
+
+    const confirmedPlans: PlanForConfirmation[] = [];
+    const r = await runAgent({
+      userPrompt: "tighten this up",
+      session, messages: [], autoApprove: false,
+      confirm: async (plan) => { confirmedPlans.push(plan); return { approved: true }; },
+      provider, critic,
+    });
+
+    assert.equal(r.isError, false);
+    // draft + 2 revisions = 3 reviews; MAX_CRITIC_REVISIONS bounds the cycle.
+    assert.equal(calls.length, MAX_CRITIC_REVISIONS + 1);
+    assert.equal(confirmedPlans.length, 1, "confirm still fired exactly once");
+    // The final plan carries the outstanding concerns for the user to arbitrate.
+    assert.equal(confirmedPlans[0]!.summary, "Draft 3.");
+    assert.equal(confirmedPlans[0]!.outstandingConcerns?.length, 2);
+    // The user approved it anyway → applied (split at 15, moved).
+    assert.equal(clipsInOrder(r.session.state.timeline)[0]!.inPoint, 15);
+    assert.equal(r.session.undo.length, 1);
+  });
+
+  test("threshold: a single-op plan skips the critic entirely", async () => {
+    const { session, clipId } = makeSession();
+    const provider = mockProvider([
+      toolUse("propose_edit_plan", {
+        summary: "Trim.",
+        operations: [{ type: "trim", clipId, inPoint: 0, outPoint: 30 }],
+      }, "tu_plan"),
+      endTurn("Done."),
+    ]);
+    const { critic, calls } = criticStub([APPROVE]);
+
+    let confirmCalls = 0;
+    const r = await runAgent({
+      userPrompt: "trim to 30s",
+      session, messages: [], autoApprove: false,
+      confirm: async () => { confirmCalls++; return { approved: true }; },
+      provider, critic,
+    });
+
+    assert.equal(r.isError, false);
+    assert.equal(calls.length, 0, "single-op edits are never reviewed");
+    assert.equal(confirmCalls, 1);
+    assert.equal(clipsInOrder(r.session.state.timeline)[0]!.outPoint, 30);
+  });
+
+  test("threshold: a 2-op plan without a survey skips; the same size AFTER survey_sources is reviewed with the map", async () => {
+    // Without survey: 2 ops → skip.
+    {
+      const { session, clipId } = makeSession();
+      const provider = mockProvider([
+        toolUse("propose_edit_plan", {
+          summary: "Trim and split.",
+          operations: [
+            { type: "trim", clipId, inPoint: 0, outPoint: 60 },
+            { type: "split", clipId, splitPoint: 20 },
+          ],
+        }, "tu_plan"),
+        endTurn("Done."),
+      ]);
+      const { critic, calls } = criticStub([APPROVE]);
+      const r = await runAgent({
+        userPrompt: "trim and split",
+        session, messages: [], autoApprove: true, confirm: noConfirm(), provider, critic,
+      });
+      assert.equal(r.isError, false);
+      assert.equal(calls.length, 0, "2 ops with no survey stays under the threshold");
+    }
+
+    // After survey: the same 2-op plan is a narrative edit → reviewed, and the
+    // critic gets the survey's map.
+    {
+      const { session, clipId } = makeSession();
+      const map = cannedMap(session.state.sources[0]!.id);
+      const { registry } = registryWithMockedSurvey(map);
+      const provider = mockProvider([
+        toolUse("survey_sources", {}, "tu_survey"),
+        toolUse("propose_edit_plan", {
+          summary: "Open strong and tighten.",
+          operations: [
+            { type: "trim", clipId, inPoint: 4, outPoint: 34 },
+            { type: "split", clipId, splitPoint: 20 },
+          ],
+        }, "tu_plan"),
+        endTurn("Done."),
+      ]);
+      const { critic, calls } = criticStub([APPROVE]);
+      const r = await runAgent({
+        userPrompt: "tighten and open strong",
+        session, messages: [], autoApprove: true, confirm: noConfirm(), provider, registry, critic,
+      });
+      assert.equal(r.isError, false);
+      assert.equal(calls.length, 1, "a multi-op plan after a survey is reviewed");
+      assert.deepEqual(calls[0]!.contentMap, map, "the critic sees the survey's map");
+    }
+  });
+
+  test("/critic off: the critic never runs and behavior is identical to pre-slice", async () => {
+    const { session, clipId } = makeSession();
+    const provider = mockProvider([
+      toolUse("propose_edit_plan", { summary: "Tighten.", operations: compoundPlanOps(clipId) }, "tu_plan"),
+      endTurn("Done."),
+    ]);
+    const { critic, calls } = criticStub([REVISE_ONCE]);
+
+    let confirmCalls = 0;
+    const r = await runAgent({
+      userPrompt: "tighten this up",
+      session, messages: [], autoApprove: false,
+      criticEnabled: false,
+      confirm: async () => { confirmCalls++; return { approved: true }; },
+      provider, critic,
+    });
+
+    assert.equal(r.isError, false);
+    assert.equal(calls.length, 0, "critic disabled → never invoked");
+    assert.equal(confirmCalls, 1);
+    assert.equal(r.session.undo.length, 1);
+  });
+
+  test("revision rounds respect the per-turn tool budget: with no budget left, present instead of revising", async () => {
+    const { session, clipId } = makeSession();
+    // Burn the budget down to 1 with 24 query_timeline calls, then propose:
+    // the plan call takes the last budget unit, so a revise verdict cannot be
+    // sent back for a re-proposal — the plan is presented with concerns.
+    const burn: ChatResponse[] = Array.from({ length: 24 }, (_, i) =>
+      toolUse("query_timeline", {}, `tu_q${i}`),
+    );
+    const provider = mockProvider([
+      ...burn,
+      toolUse("propose_edit_plan", { summary: "Tighten.", operations: compoundPlanOps(clipId) }, "tu_plan"),
+      endTurn("Done."),
+    ]);
+    const { critic, calls } = criticStub([REVISE_ONCE]);
+
+    const confirmedPlans: PlanForConfirmation[] = [];
+    const r = await runAgent({
+      userPrompt: "tighten this up",
+      session, messages: [], autoApprove: false,
+      confirm: async (plan) => { confirmedPlans.push(plan); return { approved: true }; },
+      provider, critic,
+    });
+
+    assert.equal(r.isError, false);
+    assert.equal(calls.length, 1, "reviewed once; no budget for a revision round");
+    assert.equal(confirmedPlans.length, 1);
+    assert.equal(confirmedPlans[0]!.outstandingConcerns?.length, 2, "concerns attached instead of revising");
+    assert.equal(r.session.undo.length, 1, "the approved plan still applied");
+  });
+
+  test("auto-approve still gets the critic pass on compound plans (review is about the plan, not the gate)", async () => {
+    const { session, clipId } = makeSession();
+    const provider = mockProvider([
+      toolUse("propose_edit_plan", { summary: "Draft.", operations: compoundPlanOps(clipId, 50, 20) }, "tu_p1"),
+      toolUse("propose_edit_plan", { summary: "Revised.", operations: compoundPlanOps(clipId, 60, 30) }, "tu_p2"),
+      endTurn("Done."),
+    ]);
+    const { critic, calls } = criticStub([REVISE_ONCE, APPROVE]);
+
+    const r = await runAgent({
+      userPrompt: "tighten this up",
+      session, messages: [], autoApprove: true, confirm: noConfirm(), provider, critic,
+    });
+
+    assert.equal(r.isError, false);
+    assert.equal(calls.length, 2, "reviewed, revised, re-reviewed under auto-approve");
+    assert.equal(clipsInOrder(r.session.state.timeline)[0]!.inPoint, 30, "the revised plan applied");
+    assert.equal(r.session.undo.length, 1);
   });
 });

@@ -74,6 +74,7 @@ export function staticSystemPrefix(): string {
     "- When you're confident AND you have verified the ranges, call propose_edit_plan exactly once.",
     "- Do not write plans inline as text; the propose_edit_plan tool is the only way to apply changes.",
     "- A rejected plan comes back as a tool result; you may revise and re-propose, or apologize and stop.",
+    "- A compound plan may be reviewed before the user sees it. If a tool result comes back with status \"revise\" and reviewer concerns, address every concern and call propose_edit_plan again with the revised plan — fix the plan, do not argue with the review.",
   ].join("\n");
 }
 
