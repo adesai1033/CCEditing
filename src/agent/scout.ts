@@ -154,59 +154,72 @@ export async function runScout(sourceId: string, state: ProjectState, deps: Scou
       );
       if (toolUses.length === 0) break; // scout stopped without recording → incomplete
 
-      const results: Array<Extract<ContentBlock, { type: "tool_result" }>> = [];
-      for (const tu of toolUses) {
-        if (tu.name === RECORD_FINDINGS_TOOL) {
-          const parsed = FindingsSchema.safeParse(tu.input);
-          if (!parsed.success) {
-            results.push({ type: "tool_result", toolUseId: tu.id, isError: true,
-              content: `Findings failed validation: ${parsed.error.message}` });
-            continue;
-          }
-          // Terminal: bound, stamp, write into this source's analyses, done.
-          const bounded = boundContribution(parsed.data);
-          const contribution: ScoutContribution = {
-            outline: bounded.outline,
-            keyMoments: bounded.keyMoments,
-            ...(bounded.topicBeats ? { topicBeats: bounded.topicBeats } : {}),
-            ...(bounded.silences ? { silences: bounded.silences } : {}),
-            ...(bounded.truncated ? { truncated: true } : {}),
-            generatedAt: new Date().toISOString(),
-          };
-          const finalState = writeContribution(running, sourceId, contribution);
-          deps.onProgress?.({ type: "scout_done", sourceId, incomplete: false });
-          return { sourceId, contribution, incomplete: false, state: finalState };
+      // Terminal first: once the scout records findings, nothing else in the
+      // same turn matters.
+      const results: Array<Extract<ContentBlock, { type: "tool_result" }>> = new Array(toolUses.length);
+      for (const [i, tu] of toolUses.entries()) {
+        if (tu.name !== RECORD_FINDINGS_TOOL) continue;
+        const parsed = FindingsSchema.safeParse(tu.input);
+        if (!parsed.success) {
+          results[i] = { type: "tool_result", toolUseId: tu.id, isError: true,
+            content: `Findings failed validation: ${parsed.error.message}` };
+          continue;
         }
+        // Terminal: bound, stamp, write into this source's analyses, done.
+        const bounded = boundContribution(parsed.data);
+        const contribution: ScoutContribution = {
+          outline: bounded.outline,
+          keyMoments: bounded.keyMoments,
+          ...(bounded.topicBeats ? { topicBeats: bounded.topicBeats } : {}),
+          ...(bounded.silences ? { silences: bounded.silences } : {}),
+          ...(bounded.truncated ? { truncated: true } : {}),
+          generatedAt: new Date().toISOString(),
+        };
+        const finalState = writeContribution(running, sourceId, contribution);
+        deps.onProgress?.({ type: "scout_done", sourceId, incomplete: false });
+        return { sourceId, contribution, incomplete: false, state: finalState };
+      }
 
+      // Perception calls requested in the same turn are independent reads, so
+      // they run CONCURRENTLY (a transcript, a scene scan, and a description of
+      // one source no longer wait on each other). Each sees the same base
+      // state; their cache writes are merged afterwards, in request order.
+      const base = running;
+      const pending: Array<Promise<ProjectState | null>> = [];
+      for (const [i, tu] of toolUses.entries()) {
+        if (results[i]) continue;   // a failed record_findings above
         if (toolBudget <= 0) {
-          results.push({ type: "tool_result", toolUseId: tu.id, isError: true,
-            content: "Scout tool budget exhausted — record findings now." });
+          results[i] = { type: "tool_result", toolUseId: tu.id, isError: true,
+            content: "Scout tool budget exhausted — record findings now." };
           continue;
         }
         toolBudget -= 1;
-
         if (!allowed.has(tu.name)) {
           // A name outside the read-only perception set (incl. survey/write
           // tools) is refused structurally — a scout can only perceive.
-          results.push({ type: "tool_result", toolUseId: tu.id, isError: true,
-            content: `Tool "${tu.name}" is not available to a scout.` });
+          results[i] = { type: "tool_result", toolUseId: tu.id, isError: true,
+            content: `Tool "${tu.name}" is not available to a scout.` };
           continue;
         }
-
         deps.onProgress?.({ type: "scout_tool", sourceId, name: tu.name });
         const entry = deps.registry.get(tu.name)!;
-        try {
-          const outcome = await entry.execute(running, tu.input);
-          if (outcome.ok) {
-            if (outcome.stateUpdate) running = outcome.stateUpdate;
-            results.push({ type: "tool_result", toolUseId: tu.id, content: JSON.stringify(outcome.result) });
-          } else {
-            results.push({ type: "tool_result", toolUseId: tu.id, isError: true, content: outcome.error });
+        pending.push((async () => {
+          try {
+            const outcome = await entry.execute(base, tu.input);
+            if (outcome.ok) {
+              results[i] = { type: "tool_result", toolUseId: tu.id, content: JSON.stringify(outcome.result) };
+              return outcome.stateUpdate ?? null;
+            }
+            results[i] = { type: "tool_result", toolUseId: tu.id, isError: true, content: outcome.error };
+          } catch (err: unknown) {
+            results[i] = { type: "tool_result", toolUseId: tu.id, isError: true,
+              content: `Tool threw: ${(err as Error).message}` };
           }
-        } catch (err: unknown) {
-          results.push({ type: "tool_result", toolUseId: tu.id, isError: true,
-            content: `Tool threw: ${(err as Error).message}` });
-        }
+          return null;
+        })());
+      }
+      for (const update of await Promise.all(pending)) {
+        if (update) running = mergeAnalyses(running, base, update);
       }
 
       messages = [...messages, { role: "user", content: results }];
@@ -220,6 +233,39 @@ export async function runScout(sourceId: string, state: ProjectState, deps: Scou
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * Fold one concurrent tool's state update into `running`. Every update was
+ * computed from the same `base`, so taking it whole would drop the others'
+ * cache writes. Instead, per source, any analyses key the update CHANGED
+ * relative to base is merged in: objects replace, and array caches (moments,
+ * segment descriptions, silences) union so two appends both survive.
+ */
+export function mergeAnalyses(running: ProjectState, base: ProjectState, update: ProjectState): ProjectState {
+  const baseById = new Map(base.sources.map((s) => [s.id, s]));
+  const updById = new Map(update.sources.map((s) => [s.id, s]));
+  return {
+    ...running,
+    sources: running.sources.map((s) => {
+      const u = updById.get(s.id);
+      const b = baseById.get(s.id);
+      if (!u || !b || u.analyses === b.analyses) return s;
+      const merged: Record<string, unknown> = { ...s.analyses };
+      for (const [key, value] of Object.entries(u.analyses)) {
+        const before = (b.analyses as Record<string, unknown>)[key];
+        if (value === before) continue;
+        const current = merged[key];
+        if (Array.isArray(value) && Array.isArray(current)) {
+          const seen = new Set(current.map((x) => JSON.stringify(x)));
+          merged[key] = [...current, ...value.filter((x) => !seen.has(JSON.stringify(x)))];
+        } else {
+          merged[key] = value;
+        }
+      }
+      return { ...s, analyses: merged as typeof s.analyses };
+    }),
+  };
+}
 
 function writeContribution(state: ProjectState, sourceId: string, contribution: ScoutContribution): ProjectState {
   return {

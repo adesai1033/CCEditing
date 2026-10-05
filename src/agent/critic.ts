@@ -5,15 +5,18 @@ import type { ToolSchema } from "./types.js";
 import type { ContentMap } from "./content-map.js";
 import { queryTimeline } from "./tools/query_timeline.js";
 import { criticSystemPrompt } from "./critic-prompt.js";
+import { renderEvidence, type EvidenceItem } from "./evidence.js";
 
 /**
  * The critic (3G): a SEPARATE context that reviews a drafted plan before the
  * user ever sees it. The isolation is the design, not an implementation detail:
  * the director's context is biased toward the plan it just authored, so the
- * critic gets the user's original request, the ContentMap, the drafted plan,
- * and the timeline state — and explicitly NOT the director's conversation
- * history. Feeding it the director's reasoning would rebuild the prompt-level
- * self-review this slice exists to improve on.
+ * critic gets the user's original request, the ContentMap, the director's
+ * perception EVIDENCE (raw tool observations — see evidence.ts), the drafted
+ * plan, and the timeline state — and explicitly NOT the director's
+ * conversation history or reasoning. Feeding it the director's reasoning would
+ * rebuild the prompt-level self-review this slice exists to improve on;
+ * withholding the observations made it reject well-grounded plans as guesses.
  *
  * Hard invariants (same family as the scouts', 3E-3):
  *  - Read-only, structurally. This module imports neither applyPlan nor
@@ -47,6 +50,8 @@ export interface CriticVerdict {
 export interface CriticInput {
   userRequest: string;
   contentMap: ContentMap | null;   // null when the director never surveyed
+  /** What the director's perception tools returned this turn. */
+  evidence?: EvidenceItem[];
   plan: { summary: string; operations: unknown[] };
   renderedPlan: string[];
   timelineState: ProjectState;
@@ -179,7 +184,14 @@ async function buildReviewPayload(input: CriticInput): Promise<string> {
     "## Content map",
     ...(input.contentMap
       ? ["```json", JSON.stringify(input.contentMap, null, 2), "```"]
-      : ["(no content map — the director did not survey sources this turn)"]),
+      : [(input.evidence?.length ?? 0) > 0
+          ? "(no content map — the director verified with targeted tools instead; see the evidence below)"
+          : "(no content map — the director did not survey sources this turn)"]),
+    "",
+    "## Director's evidence (raw perception results from this turn)",
+    ...((input.evidence?.length ?? 0) > 0
+      ? renderEvidence(input.evidence!)
+      : ["(none — the director ran no perception tools this turn)"]),
     "",
     "## Drafted plan",
     `Summary: ${input.plan.summary}`,

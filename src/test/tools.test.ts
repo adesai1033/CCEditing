@@ -127,7 +127,7 @@ describe("find_visual_moment", () => {
       },
       searchMoments: async () => {
         searched = true;
-        return [{ start: 5, end: 10, confidence: 0.9 }];
+        return [{ start: 5, end: 10, rank: 1 }];
       },
     };
 
@@ -135,7 +135,7 @@ describe("find_visual_moment", () => {
     assert.ok(r.ok);
     assert.equal(indexedFile, source.filePath);
     assert.equal(searched, true);
-    assert.deepEqual(r.result.hits, [{ start: 5, end: 10, confidence: 0.9 }]);
+    assert.deepEqual(r.result.hits, [{ start: 5, end: 10, rank: 1 }]);
     // stateUpdate should contain both the index reference AND the moment cache
     const updatedSrc = r.stateUpdate!.sources[0]!;
     assert.equal(updatedSrc.analyses.twelveLabs?.indexId, "idx1");
@@ -152,7 +152,7 @@ describe("find_visual_moment", () => {
         ...source,
         analyses: {
           twelveLabs: { indexId: "idx1", videoId: "vid1", status: "indexed", indexedAt: "x" },
-          moments: [{ query: "ball", hits: [{ start: 1, end: 2, confidence: 0.5 }], retrievedAt: "x" }],
+          moments: [{ query: "ball", hits: [{ start: 1, end: 2, rank: 1 }], retrievedAt: "x" }],
         },
       }],
     };
@@ -166,7 +166,7 @@ describe("find_visual_moment", () => {
     const r = await executeFindVisualMoment(state, { sourceId: source.id, query: "ball" }, backend);
     assert.ok(r.ok);
     assert.equal(backendCalled, false);
-    assert.deepEqual(r.result.hits, [{ start: 1, end: 2, confidence: 0.5 }]);
+    assert.deepEqual(r.result.hits, [{ start: 1, end: 2, rank: 1 }]);
     // No state update on a pure cache hit
     assert.equal(r.stateUpdate, undefined);
   });
@@ -186,7 +186,7 @@ describe("find_visual_moment", () => {
     let indexCalled = false;
     const backend: TwelveLabsBackend = {
       indexVideo: async () => { indexCalled = true; throw new Error("should not be called"); },
-      searchMoments: async () => [{ start: 0, end: 1, confidence: 0.7 }],
+      searchMoments: async () => [{ start: 0, end: 1, rank: 1 }],
     };
 
     const r = await executeFindVisualMoment(state, { sourceId: source.id, query: "tree" }, backend);

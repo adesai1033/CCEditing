@@ -71,7 +71,7 @@ describe("v3 round-trip", () => {
         moments: [
           {
             query: "river crossing",
-            hits: [{ start: 25, end: 32, confidence: 0.8 }],
+            hits: [{ start: 25, end: 32, rank: 1 }],
             retrievedAt: "2026-06-15T12:03:00Z",
           },
         ],

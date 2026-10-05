@@ -1,4 +1,5 @@
-import type { ProjectState, SourceFile } from "../../project/types.js";
+import type { ProjectState, SourceFile, MomentHit } from "../../project/types.js";
+import { normalizeMomentHits } from "../../project/types.js";
 import type { Tool, ToolSchema, ToolResult } from "../types.js";
 import { realBackend as defaultBackend, type TwelveLabsBackend } from "../backends/twelvelabs.js";
 import { getDefaultIndexRegistry, type IndexRegistry } from "../indexing.js";
@@ -9,7 +10,8 @@ export interface FindVisualMomentInput {
 }
 
 export interface FindVisualMomentOutput {
-  hits: Array<{ start: number; end: number; confidence: number }>;
+  /** Best first. `rank` is relative order only — not a match score. */
+  hits: MomentHit[];
 }
 
 /**
@@ -29,7 +31,8 @@ export async function executeFindVisualMoment(
   // Cache hit: exact-match query against the cached moments list
   const cached = source.analyses.moments?.find((m) => m.query === input.query);
   if (cached) {
-    return { ok: true, result: { hits: cached.hits } };
+    // Normalized so caches written before ranks (with `confidence`) read the same.
+    return { ok: true, result: { hits: normalizeMomentHits(cached.hits) } };
   }
 
   // Index if not yet indexed — through the registry (3E-6), never directly:
@@ -66,9 +69,9 @@ export async function executeFindVisualMoment(
 
   // Search
   const tl = updatedSource.analyses.twelveLabs!;
-  let hits: Array<{ start: number; end: number; confidence: number }>;
+  let hits: MomentHit[];
   try {
-    hits = await backend.searchMoments(tl.indexId, tl.videoId, input.query);
+    hits = normalizeMomentHits(await backend.searchMoments(tl.indexId, tl.videoId, input.query));
   } catch (err: unknown) {
     return { ok: false, error: `TwelveLabs search failed: ${(err as Error).message}` };
   }
@@ -103,7 +106,10 @@ const schema: ToolSchema = {
   name: "find_visual_moment",
   description:
     "Search inside a source video for visual moments matching a natural-language " +
-    "description. Returns timestamp ranges (seconds) with confidence scores. " +
+    "description. Returns candidate timestamp ranges (seconds), best first, each with a " +
+    "`rank` (1 = likeliest). Rank is ORDER ONLY — the service gives no match score, so a " +
+    "rank-1 hit can still be wrong and a query with no real match still returns hits. " +
+    "Verify the top candidates with describe_segment before cutting on them. " +
     "Use this to locate specific events ('the car crossing the finish line', " +
     "'the summit shot') so you can trim or split around them. " +
     "Cloud indexing usually starts in the background when a file is opened; " +

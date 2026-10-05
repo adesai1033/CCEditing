@@ -570,7 +570,7 @@ describe("v4 migration", () => {
     writeFileSync(projectFilePath(), JSON.stringify(v3), "utf-8");
 
     const session = await loadProject(projectFilePath());
-    assert.equal(session.state.version, 4);
+    assert.equal(session.state.version, 5);
     assert.equal(clipsInOrder(session.state.timeline)[0]!.userLabel, undefined);
   });
 });
@@ -718,6 +718,6 @@ describe("/preview", () => {
 
   test("/help lists /preview", async () => {
     const r = await dispatch("/help", noProject);
-    assert.match(r.output, /\/preview \[clip \| start end\]/);
+    assert.match(r.output, /\/preview \[--term\] \[clip \| start end\]/);
   });
 });

@@ -393,15 +393,14 @@ describe("runAgent — extended thinking", () => {
     assert.ok(requests[0]!.maxTokens > 4096, `maxTokens ${requests[0]!.maxTokens} must exceed 4096`);
   });
 
-  test("max_output stop reason is an explicit error, not a silent end", async () => {
+  test("max_output twice in a row (after the larger-budget retry) is an explicit error, not a silent end", async () => {
     const { session } = makeSession();
-    const provider = mockProvider([
-      {
-        content: [{ type: "text", text: "partial answer that got cut" }],
-        stopReason: "max_output",
-        usage: { inputTokens: 0, outputTokens: 16000 },
-      },
-    ]);
+    const cut: ChatResponse = {
+      content: [{ type: "text", text: "partial answer that got cut" }],
+      stopReason: "max_output",
+      usage: { inputTokens: 0, outputTokens: 32000 },
+    };
+    const provider = mockProvider([cut, cut]);
 
     const r = await runAgent({
       userPrompt: "do a huge thing",
@@ -414,6 +413,24 @@ describe("runAgent — extended thinking", () => {
 
     assert.equal(r.isError, true, "max_output must surface as an error");
     assert.match(r.output, /cut off|output-token limit|narrow/i);
+  });
+
+  test("one truncated turn is discarded and re-asked once with a bigger budget", async () => {
+    const { session, clipId } = makeSession();
+    const { provider, requests } = capturingProvider([
+      { content: [{ type: "text", text: "half a plan" }], stopReason: "max_output", usage: { inputTokens: 0, outputTokens: 32000 } },
+      toolUse("propose_edit_plan", { summary: "Trim.", operations: [{ type: "trim", clipId, inPoint: 0, outPoint: 30 }] }, "tu_plan"),
+      endTurn("Done."),
+    ]);
+    const r = await runAgent({
+      userPrompt: "trim", session, messages: [], autoApprove: true,
+      confirm: async () => ({ approved: true }), provider,
+    });
+    assert.equal(r.isError, false, r.output);
+    assert.ok(requests[1]!.maxTokens > requests[0]!.maxTokens, "the retry asks for more room");
+    assert.equal(requests[1]!.messages.length, requests[0]!.messages.length, "the truncated response never entered history");
+    assert.ok(!JSON.stringify(r.messages).includes("half a plan"));
+    assert.equal(clipsInOrder(r.session.state.timeline)[0]!.outPoint, 30);
   });
 
   test("a turn with no reasoning block is handled with no error and no thinking event", async () => {
@@ -1223,5 +1240,57 @@ describe("runAgent — critic (3G)", () => {
     assert.equal(calls.length, 2, "reviewed, revised, re-reviewed under auto-approve");
     assert.equal(clipsInOrder(r.session.state.timeline)[0]!.inPoint, 30, "the revised plan applied");
     assert.equal(r.session.undo.length, 1);
+  });
+});
+
+// ── Critic evidence ───────────────────────────────────────────────────────────
+
+describe("runAgent — the critic sees the director's perception evidence", () => {
+  test("a transcript lookup this turn reaches the critic with exact times; non-perception calls don't", async () => {
+    const { session, clipId } = makeSession();
+    // Cache a transcript so the real transcribe_audio tool answers offline.
+    const src = session.state.sources[0]!;
+    const withTranscript = {
+      ...session,
+      state: {
+        ...session.state,
+        sources: [{
+          ...src,
+          analyses: {
+            ...src.analyses,
+            transcript: {
+              segments: [
+                { start: 48.3, end: 49.44, text: "That's a new place." },
+                { start: 49.98, end: 51.84, text: "I'd like to check with Jay before booking the ride." },
+              ],
+              duration: 120, model: "test", hasAudio: true, transcribedAt: "x",
+            },
+          },
+        }],
+      },
+    };
+    const provider = mockProvider([
+      toolUse("transcribe_audio", { sourceId: src.id, query: "new place check" }, "tu_t"),
+      toolUse("query_timeline", {}, "tu_q"),
+      toolUse("propose_edit_plan", { summary: "Tighten.", operations: compoundPlanOps(clipId) }, "tu_plan"),
+      endTurn("Done."),
+    ]);
+    const { critic, calls } = criticStub([APPROVE]);
+
+    await runAgent({
+      userPrompt: "cut after the new-place line",
+      session: withTranscript, messages: [], autoApprove: true,
+      confirm: async () => ({ approved: true }),
+      provider, critic,
+    });
+
+    assert.equal(calls.length, 1);
+    const evidence = calls[0]!.evidence ?? [];
+    assert.equal(evidence.length, 1, "only the perception call is evidence");
+    assert.equal(evidence[0]!.tool, "transcribe_audio");
+    assert.equal(evidence[0]!.source, src.fileName);
+    assert.deepEqual(evidence[0]!.input, { query: "new place check" });
+    const lines = (evidence[0]!.result as { lines: string[] }).lines;
+    assert.ok(lines.includes("49.98–51.84 I'd like to check with Jay before booking the ride."), "exact transcript times reach the critic");
   });
 });

@@ -16,6 +16,8 @@ import {
   buildPreviewTrimArgs,
   renderPreviewFromSegments,
   openInPlayer,
+  playInTerminal,
+  TIMG_INSTALL_HINT,
   PREVIEW_SETTINGS,
   type FfmpegRunner,
   type PreviewSegment,
@@ -154,10 +156,20 @@ describe("scratchStateForPlan", () => {
 
 describe("preview scope", () => {
   test("no args → timeline; one arg → clip; two args → range; more → usage", () => {
-    assert.deepEqual(parsePreviewArgs([]), { ok: true, scope: { type: "timeline" } });
-    assert.deepEqual(parsePreviewArgs(["2"]), { ok: true, scope: { type: "clip", ref: "2" } });
-    assert.deepEqual(parsePreviewArgs(["0:05", "15"]), { ok: true, scope: { type: "range", start: 5, end: 15 } });
+    assert.deepEqual(parsePreviewArgs([]), { ok: true, scope: { type: "timeline" }, terminal: false });
+    assert.deepEqual(parsePreviewArgs(["2"]), { ok: true, scope: { type: "clip", ref: "2" }, terminal: false });
+    assert.deepEqual(parsePreviewArgs(["0:05", "15"]), { ok: true, scope: { type: "range", start: 5, end: 15 }, terminal: false });
     assert.ok(!parsePreviewArgs(["1", "2", "3"]).ok);
+  });
+
+  test("--term selects inline playback in any position and is not a clip ref", () => {
+    assert.deepEqual(parsePreviewArgs(["--term"]), { ok: true, scope: { type: "timeline" }, terminal: true });
+    assert.deepEqual(parsePreviewArgs(["--term", "2"]), { ok: true, scope: { type: "clip", ref: "2" }, terminal: true });
+    assert.deepEqual(parsePreviewArgs(["2", "--term"]), { ok: true, scope: { type: "clip", ref: "2" }, terminal: true });
+    assert.deepEqual(parsePreviewArgs(["--terminal", "0:05", "15"]), { ok: true, scope: { type: "range", start: 5, end: 15 }, terminal: true });
+    const unknown = parsePreviewArgs(["--nope"]);
+    assert.ok(!unknown.ok);
+    assert.match(unknown.error, /--nope/);
   });
 
   test("an inverted range and unparseable times error cleanly", () => {
@@ -375,6 +387,85 @@ describe("openInPlayer", () => {
   });
 });
 
+// ── In-terminal playback (--term) ─────────────────────────────────────────────
+
+describe("playInTerminal", () => {
+  type FakeChild = EventEmitter & { stderr: EventEmitter; kill: (sig?: string) => boolean; killed?: string };
+
+  function fakeSpawnWith(script: (child: FakeChild, args: string[]) => void) {
+    const spawned: { bin: string; args: string[]; stdio: unknown }[] = [];
+    const spawnFn = ((bin: string, args: string[], opts: { stdio: unknown }) => {
+      spawned.push({ bin, args, stdio: opts.stdio });
+      const child = new EventEmitter() as FakeChild;
+      child.stderr = new EventEmitter();
+      child.kill = (sig) => { child.killed = sig; queueMicrotask(() => child.emit("close", null, sig)); return true; };
+      script(child, args);
+      return child;
+    }) as unknown as typeof import("node:child_process").spawn;
+    return { spawnFn, spawned };
+  }
+  const captured = () => { const out: string[] = []; return { out, stdout: { write: (s: string) => { out.push(s); return true; } } }; };
+
+  test("enters the alternate screen, plays, and leaves it on success", async () => {
+    const { spawnFn, spawned } = fakeSpawnWith((c) => queueMicrotask(() => c.emit("close", 0, null)));
+    const { out, stdout } = captured();
+    const r = await playInTerminal("/tmp/p.mp4", { spawnFn, stdout });
+    assert.deepEqual(r, { ok: true });
+    assert.equal(spawned[0]!.bin, "timg");
+    assert.ok(spawned[0]!.args.includes("/tmp/p.mp4"));
+    assert.ok(spawned[0]!.args.includes("-ph"), "pinned pixelation so timg never probes the terminal");
+    assert.deepEqual(spawned[0]!.stdio, ["ignore", "inherit", "pipe"]);   // REPL keeps the keyboard
+    assert.match(out[0]!, /\x1b\[\?1049h/);
+    assert.match(out[out.length - 1]!, /\x1b\[\?1049l/);
+  });
+
+  test("a missing timg binary is a friendly install hint, and the screen is restored", async () => {
+    const { spawnFn } = fakeSpawnWith((c) => queueMicrotask(() => {
+      const err = new Error("spawn timg ENOENT") as NodeJS.ErrnoException; err.code = "ENOENT"; c.emit("error", err);
+    }));
+    const { out, stdout } = captured();
+    const r = await playInTerminal("/tmp/p.mp4", { spawnFn, stdout });
+    assert.ok(!r.ok);
+    assert.equal(r.code, "NO_TIMG");
+    assert.equal(r.error, TIMG_INSTALL_HINT);
+    assert.match(out[out.length - 1]!, /\x1b\[\?1049l/);
+  });
+
+  test("a non-zero exit surfaces timg's last stderr line", async () => {
+    const { spawnFn } = fakeSpawnWith((c) => queueMicrotask(() => {
+      c.stderr.emit("data", Buffer.from("something\nCould not decode file\n"));
+      c.emit("close", 1, null);
+    }));
+    const r = await playInTerminal("/tmp/p.mp4", { spawnFn, stdout: captured().stdout });
+    assert.ok(!r.ok);
+    assert.equal(r.code, "TIMG_FAILED");
+    assert.equal(r.error, "Could not decode file");
+  });
+
+  test("an abort kills the child and resolves ABORTED only after it exits", async () => {
+    let child: FakeChild | null = null;
+    const { spawnFn } = fakeSpawnWith((c) => { child = c; });
+    const controller = new AbortController();
+    const p = playInTerminal("/tmp/p.mp4", { spawnFn, stdout: captured().stdout, signal: controller.signal });
+    await new Promise((r) => setImmediate(r));
+    controller.abort();
+    const r = await p;
+    assert.ok(!r.ok);
+    assert.equal(r.code, "ABORTED");
+    assert.equal(child!.killed, "SIGTERM");
+  });
+
+  test("an already-aborted signal never spawns", async () => {
+    const { spawnFn, spawned } = fakeSpawnWith(() => {});
+    const controller = new AbortController(); controller.abort();
+    const { out, stdout } = captured();
+    const r = await playInTerminal("/tmp/p.mp4", { spawnFn, stdout, signal: controller.signal });
+    assert.ok(!r.ok && r.code === "ABORTED");
+    assert.equal(spawned.length, 0);
+    assert.equal(out.length, 0);   // no screen switch for a no-op
+  });
+});
+
 // ── Orchestration: previewStateScope ──────────────────────────────────────────
 
 describe("previewStateScope", () => {
@@ -420,6 +511,51 @@ describe("previewStateScope", () => {
     assert.ok(!r.ok);
     assert.equal(r.aborted, true);
     assert.match(r.error, /cancelled/i);
+  });
+
+  test("--term plays inline instead of launching the system player, bracketed by onPlayback", async () => {
+    const state = makeState(1);
+    const events: string[] = [];
+    let opened = 0;
+    const r = await previewStateScope(state, { type: "timeline" }, {
+      render: okRender({ cachedSegments: 1 }).render,
+      terminal: true,
+      onPlayback: (playing) => { events.push(playing ? "start" : "stop"); },
+      play: async (path) => { events.push(`play:${path}`); return { ok: true }; },
+      open: async () => { opened += 1; return { launched: true }; },
+    });
+    assert.ok(r.ok);
+    assert.match(r.message, /played in the terminal/);
+    assert.match(r.message, /1 segment reused/);
+    assert.deepEqual(events, ["start", "play:/tmp/preview-1.mp4", "stop"]);
+    assert.equal(opened, 0);
+  });
+
+  test("--term without timg fails softly and still hands over the rendered file", async () => {
+    const state = makeState(1);
+    const events: string[] = [];
+    const r = await previewStateScope(state, { type: "timeline" }, {
+      render: okRender().render,
+      terminal: true,
+      onPlayback: (playing) => { events.push(playing ? "start" : "stop"); },
+      play: async () => ({ ok: false, code: "NO_TIMG", error: TIMG_INSTALL_HINT }),
+    });
+    assert.ok(!r.ok);
+    assert.equal(r.aborted, undefined);
+    assert.match(r.error, /brew install timg/);
+    assert.match(r.error, /preview-1\.mp4/);
+    assert.deepEqual(events, ["start", "stop"]);   // the REPL is always unfrozen
+  });
+
+  test("stopping --term playback is a cancellation, not an error", async () => {
+    const r = await previewStateScope(makeState(1), { type: "timeline" }, {
+      render: okRender().render,
+      terminal: true,
+      play: async () => ({ ok: false, code: "ABORTED", error: "cancelled" }),
+    });
+    assert.ok(!r.ok);
+    assert.equal(r.aborted, true);
+    assert.match(r.error, /stopped/i);
   });
 
   test("an empty timeline is a friendly message with no render attempt", async () => {

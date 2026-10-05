@@ -61,6 +61,7 @@ describe("architecture guard", () => {
       join(AGENT_DIR, "tools", "survey_sources.ts"),
       join(AGENT_DIR, "critic.ts"),
       join(AGENT_DIR, "critic-prompt.ts"),
+      join(AGENT_DIR, "evidence.ts"),
       // 3H: preview joins the read-only club. It computes scratch states via
       // applyOperations (the pure half) and must never reach the committing
       // applyPlan or the plan tool.

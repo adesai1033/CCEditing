@@ -51,23 +51,114 @@ export function selectWindow(segments: TranscriptSegment[], start: number, end: 
 }
 
 /**
- * Query mode is deliberately dumb: case-insensitive substring over segment
- * text, plus a segment of context each side. The agent does the semantic work;
- * the tool only retrieves. Matches are merged so overlapping context windows
- * don't return the same segment twice.
+ * Query mode, in two passes. The agent does the semantic work; the tool only
+ * retrieves — but retrieval must survive the agent paraphrasing the speech.
+ *
+ *  1. Exact: case-insensitive substring within one segment.
+ *  2. Words (only when 1 finds nothing): score every run of up to
+ *     WORD_MATCH_SPAN consecutive segments by the share of the query's content
+ *     words it contains, so "this is a new place, let me check with your son"
+ *     still finds "That's a new place." … "I'd like to check with Jay" even
+ *     though the wording differs and the line spans three segments.
+ *
+ * Hits get one segment of context each side; overlapping windows are merged so
+ * no segment repeats.
  */
 export function selectQuery(segments: TranscriptSegment[], query: string): TranscriptSegment[] {
-  const needle = query.trim().toLowerCase();
-  if (needle.length === 0) return [];
+  return matchQuery(segments, query).segments;
+}
 
+export interface QueryMatch {
+  segments: TranscriptSegment[];
+  mode: "exact" | "words" | "none";
+  /** Query words found, for the "words" mode note. */
+  matchedWords: string[];
+}
+
+/** Longest run of consecutive segments a word match may span. */
+const WORD_MATCH_SPAN = 3;
+/** Share of the query's content words a passage must contain. */
+const WORD_MATCH_MIN_SCORE = 0.5;
+const WORD_MATCH_MAX_PASSAGES = 3;
+
+const STOPWORDS = new Set([
+  "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "did", "do", "does", "for", "from",
+  "had", "has", "have", "he", "her", "him", "his", "how", "i", "if", "in", "into", "is", "it", "its",
+  "just", "let", "me", "my", "of", "on", "or", "our", "out", "she", "so", "that", "the", "their",
+  "them", "then", "there", "they", "this", "to", "up", "us", "was", "we", "were", "what", "when",
+  "where", "which", "who", "will", "with", "would", "you", "your", "part", "says", "said", "say",
+]);
+
+/** Lowercased word tokens; contractions lose their suffix ("that's" → "that"). */
+function tokens(text: string): string[] {
+  return text
+    .toLowerCase()
+    .replace(/[’‘]/g, "'")
+    .replace(/'(s|d|ll|re|ve|m|t)\b/g, "")
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
+
+/** Crude stem so "booking"/"booked"/"books" meet "book". */
+function stem(w: string): string {
+  return w.length > 4 ? w.replace(/(ing|ed|es|s)$/, "") : w;
+}
+
+export function matchQuery(segments: TranscriptSegment[], query: string): QueryMatch {
+  const needle = query.trim().toLowerCase();
+  if (needle.length === 0) return { segments: [], mode: "none", matchedWords: [] };
+
+  const exact: number[] = [];
+  segments.forEach((s, i) => { if (s.text.toLowerCase().includes(needle)) exact.push(i); });
+  if (exact.length > 0) {
+    return { segments: withContext(segments, exact.map((i) => [i, i] as const)), mode: "exact", matchedWords: [] };
+  }
+
+  const words = [...new Set(tokens(query).filter((w) => !STOPWORDS.has(w) && w.length > 1))];
+  if (words.length === 0) return { segments: [], mode: "none", matchedWords: [] };
+  const segStems = segments.map((s) => new Set(tokens(s.text).map(stem)));
+
+  // Every passage of 1..SPAN consecutive segments, scored.
+  const passages: Array<{ from: number; to: number; score: number; matched: string[] }> = [];
+  for (let from = 0; from < segments.length; from++) {
+    for (let to = from; to < Math.min(segments.length, from + WORD_MATCH_SPAN); to++) {
+      const matched = words.filter((w) => {
+        const st = stem(w);
+        for (let k = from; k <= to; k++) if (segStems[k]!.has(st)) return true;
+        return false;
+      });
+      const score = matched.length / words.length;
+      const enough = matched.length >= Math.min(2, words.length);
+      if (score >= WORD_MATCH_MIN_SCORE && enough) passages.push({ from, to, score, matched });
+    }
+  }
+  if (passages.length === 0) return { segments: [], mode: "none", matchedWords: [] };
+
+  // Best first; at equal score the tighter passage wins. Then keep the top few
+  // that don't overlap one already chosen.
+  passages.sort((a, b) => b.score - a.score || (a.to - a.from) - (b.to - b.from) || a.from - b.from);
+  const chosen: typeof passages = [];
+  for (const p of passages) {
+    if (chosen.length >= WORD_MATCH_MAX_PASSAGES) break;
+    if (chosen.some((c) => p.from <= c.to && c.from <= p.to)) continue;
+    chosen.push(p);
+  }
+  chosen.sort((a, b) => a.from - b.from);
+  const matchedWords = [...new Set(chosen.flatMap((c) => c.matched))];
+  return {
+    segments: withContext(segments, chosen.map((c) => [c.from, c.to] as const)),
+    mode: "words",
+    matchedWords,
+  };
+}
+
+function withContext(segments: TranscriptSegment[], ranges: ReadonlyArray<readonly [number, number]>): TranscriptSegment[] {
   const keep = new Set<number>();
-  segments.forEach((s, i) => {
-    if (!s.text.toLowerCase().includes(needle)) return;
-    for (let j = i - CONTEXT_SEGMENTS; j <= i + CONTEXT_SEGMENTS; j++) {
+  for (const [from, to] of ranges) {
+    for (let j = from - CONTEXT_SEGMENTS; j <= to + CONTEXT_SEGMENTS; j++) {
       if (j >= 0 && j < segments.length) keep.add(j);
     }
-  });
-
+  }
   return [...keep].sort((a, b) => a - b).map((i) => segments[i]!);
 }
 
@@ -182,7 +273,16 @@ function noteFor(
     );
   }
   if (input.query !== undefined && selected.length === 0) {
-    return `No segment matched "${input.query}". The words may be phrased differently — try another term, or read a window with start/end.`;
+    return `No segment matched "${input.query}", even by shared words. Try other terms, or read a window with start/end.`;
+  }
+  if (input.query !== undefined) {
+    const m = matchQuery(all, input.query);
+    if (m.mode === "words") {
+      return (
+        `No exact match for "${input.query}"; these are the closest passages by shared words ` +
+        `(${m.matchedWords.join(", ")}). Read them to confirm it is the line you want.`
+      );
+    }
   }
   return undefined;
 }
@@ -246,9 +346,10 @@ const schema: ToolSchema = {
       query: {
         type: "string",
         description:
-          "Optional case-insensitive text search over the transcript. Returns matching " +
-          "segments plus one segment of context each side. Prefer this over reading a " +
-          "wide window.",
+          "Optional search over the transcript. Exact phrase matches come first; if " +
+          "there are none, the closest passages by shared words are returned instead " +
+          "(so paraphrasing what was said still works). Results include one segment of " +
+          "context each side. Prefer this over reading a wide window.",
       },
       force: { type: "boolean", description: "Re-transcribe, ignoring the cache. Default false. Rarely needed." },
     },

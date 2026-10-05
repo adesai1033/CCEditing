@@ -37,6 +37,8 @@ interface Props {
   onConfirmPreview?: () => void;
   /** When set, a preview render is in flight: Ctrl-C cancels it instead of exiting. */
   previewActive?: boolean;
+  /** When set, `/preview --term` playback owns the screen: q / Ctrl-C stop it, all else is swallowed. */
+  playbackActive?: boolean;
   /** Cancels the in-flight preview render (decision 6). */
   onPreviewCancel?: () => void;
   /** When set, a turn is streaming: typing composes the queue (3K). */
@@ -70,7 +72,7 @@ export function InputLine({
   onHistoryUp, onHistoryDown,
   timelineActive, onViewportZoom, onViewportScroll,
   confirmMode = false, onConfirmAnswer, onConfirmPreview,
-  previewActive = false, onPreviewCancel,
+  previewActive = false, playbackActive = false, onPreviewCancel,
   disabled = false,
   spinner = 0,
   queue, onQueueType, onQueueBackspace, onQueueEnter,
@@ -122,6 +124,14 @@ export function InputLine({
   }
 
   useInput((input, key) => {
+    // Inline playback: nothing but "stop" may act — a typed key would otherwise
+    // land in the queue and run after the video ends. Esc is deliberately not a
+    // stop key: timg's terminal size query is answered on stdin as an ESC-led
+    // sequence, and a split read could deliver a bare ESC.
+    if (playbackActive) {
+      if ((key.ctrl && input === "c") || input === "q" || input === "Q") onPreviewCancel?.();
+      return;
+    }
     if (key.ctrl && input === "c") {
       // Ctrl-C during a preview render cancels the render, not the REPL (3H).
       if (previewActive) { onPreviewCancel?.(); return; }

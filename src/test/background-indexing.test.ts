@@ -189,7 +189,7 @@ describe("find_visual_moment — through the registry", () => {
     // The tool's own backend must NOT be asked to index — it joins the job.
     const backend = {
       indexVideo: async (): Promise<IndexResult> => { throw new Error("tool must not start a second index"); },
-      searchMoments: async () => [{ start: 3, end: 7, confidence: 0.9 }],
+      searchMoments: async () => [{ start: 3, end: 7, rank: 1 }],
     };
 
     const toolPromise = executeFindVisualMoment(state, { sourceId: source.id, query: "the reveal" }, backend, registry);
@@ -197,7 +197,7 @@ describe("find_visual_moment — through the registry", () => {
     const r = await toolPromise;
 
     assert.ok(r.ok, `tool failed: ${!r.ok ? r.error : ""}`);
-    assert.deepEqual(r.result.hits, [{ start: 3, end: 7, confidence: 0.9 }]);
+    assert.deepEqual(r.result.hits, [{ start: 3, end: 7, rank: 1 }]);
     assert.equal(backgroundCalls, 1, "exactly one index job total");
     // The tool persisted the index result into analyses (durable across sessions).
     assert.ok(r.stateUpdate);
@@ -237,7 +237,7 @@ describe("find_visual_moment — through the registry", () => {
     const registry = new IndexRegistry({ indexFn: async () => { throw new Error("must not index"); } });
     const backend = {
       indexVideo: async (): Promise<IndexResult> => { throw new Error("must not index"); },
-      searchMoments: async () => [{ start: 1, end: 2, confidence: 0.5 }],
+      searchMoments: async () => [{ start: 1, end: 2, rank: 1 }],
     };
 
     const r = await executeFindVisualMoment(state, { sourceId: source.id, query: "q" }, backend, registry);
@@ -266,7 +266,7 @@ describe("background indexing — concurrent mixed-state fan-out", () => {
     const backend = {
       // The per-call fn the tool passes routes to the registry's default here.
       indexVideo: async (): Promise<IndexResult> => { throw new Error("unused — registry default wins on new jobs only when tool passes fn"); },
-      searchMoments: async () => [{ start: 0, end: 1, confidence: 1 }],
+      searchMoments: async () => [{ start: 0, end: 1, rank: 1 }],
     };
     // The tool passes its backend fn for NEW jobs, so make it behave per-source:
     const perSourceBackend = (src: SourceFile) => ({

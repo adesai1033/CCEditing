@@ -1,4 +1,6 @@
 import { createReadStream } from "node:fs";
+import { makeProxy, INDEX_PROXY } from "../../media/proxy.js";
+import { normalizeMomentHits, type MomentHit } from "../../project/types.js";
 import { TwelveLabs } from "twelvelabs-js";
 
 const INDEX_NAME_DEFAULT = "cutcli";
@@ -54,9 +56,13 @@ export async function indexVideo(filePath: string): Promise<{ indexId: string; v
   const indexId = await ensureIndex();
   const c = client();
 
+  // Index a 720p proxy rather than the original: a 1 GB 4K/60fps source
+  // becomes ~8 MB with identical timestamps (media/proxy.ts), so search hits
+  // are still valid source times.
+  const proxy = await makeProxy(filePath, INDEX_PROXY);
   const task = await c.tasks.create({
     indexId,
-    videoFile: createReadStream(filePath),
+    videoFile: createReadStream(proxy.path),
   });
   if (!task.id) throw new Error("TwelveLabs: task creation returned no id");
 
@@ -72,16 +78,16 @@ export async function indexVideo(filePath: string): Promise<{ indexId: string; v
 
 /**
  * Search the cutcli index for a natural-language event description, scoped
- * to one video. Returns timestamp ranges with confidence scores. The
- * SearchItem `rank` field is integer-ranked across all hits; we expose it
- * as `confidence` for the agent's purposes (lower rank = better match, so
- * we normalize: confidence = 1 / (1 + rank)).
+ * to one video. TwelveLabs returns hits with an integer `rank` and no score,
+ * so that is what we report: 1-based, best first. (This used to be turned into
+ * a "confidence" of 1/(1+rank), which made every top hit look like a 50%
+ * match — an ordering dressed up as a probability.)
  */
 export async function searchMoments(
   indexId: string,
   videoId: string,
   query: string,
-): Promise<Array<{ start: number; end: number; confidence: number }>> {
+): Promise<MomentHit[]> {
   const c = client();
   const page = await c.search.query({
     indexId,
@@ -90,18 +96,13 @@ export async function searchMoments(
     filter: JSON.stringify({ id: [videoId] }),
   });
 
-  const hits: Array<{ start: number; end: number; confidence: number }> = [];
+  const raw: Array<{ start: number; end: number; rank?: number }> = [];
   for await (const item of page) {
     if (typeof item.start === "number" && typeof item.end === "number") {
-      const rank = typeof item.rank === "number" ? item.rank : 999;
-      hits.push({
-        start: item.start,
-        end: item.end,
-        confidence: 1 / (1 + rank),
-      });
+      raw.push({ start: item.start, end: item.end, ...(typeof item.rank === "number" ? { rank: item.rank } : {}) });
     }
   }
-  return hits;
+  return normalizeMomentHits(raw);
 }
 
 // Exposed for test injection — tools accept an optional backend that defaults

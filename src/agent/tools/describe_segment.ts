@@ -16,6 +16,9 @@ export interface DescribeSegmentOutput {
   cached: boolean;
 }
 
+/** How far past the source end a window may run and still be clamped. */
+const END_TOLERANCE_SECONDS = 1;
+
 export async function executeDescribeSegment(
   state: ProjectState,
   input: DescribeSegmentInput,
@@ -27,16 +30,22 @@ export async function executeDescribeSegment(
   if (input.end <= input.start) {
     return { ok: false, error: `Invalid segment: end (${input.end}) must be greater than start (${input.start})` };
   }
-  if (input.start < 0 || input.end > source.duration) {
+  // Up to a second past the end is rounding ("to the end"), clamped below;
+  // more than that means the agent has the wrong source or timeline, so say so.
+  if (input.start < 0 || input.start >= source.duration || input.end > source.duration + END_TOLERANCE_SECONDS) {
     return {
       ok: false,
       error: `Segment ${input.start}-${input.end}s is outside the source duration (0-${source.duration}s)`,
     };
   }
+  // (Seen live: an end of 51.3 on a 51.296667s source was refused, costing
+  // the agent a round trip over 3ms of rounding.)
+  const start = input.start;
+  const end = Math.min(input.end, source.duration);
 
   // Cache hit: exact (start, end) match
   const cached = source.analyses.segmentDescriptions?.find(
-    (e) => e.start === input.start && e.end === input.end,
+    (e) => e.start === start && e.end === end,
   );
   if (cached) {
     return {
@@ -53,14 +62,14 @@ export async function executeDescribeSegment(
 
   let text: string;
   try {
-    text = await backend.describeVideoSegment(source.filePath, input.start, input.end);
+    text = await backend.describeVideoSegment(source.filePath, start, end);
   } catch (err: unknown) {
     return { ok: false, error: `Gemini segment description failed: ${(err as Error).message}` };
   }
 
   const entry = {
-    start: input.start,
-    end: input.end,
+    start: start,
+    end: end,
     text,
     model: DESCRIBE_MODEL,
     generatedAt: new Date().toISOString(),
@@ -82,7 +91,7 @@ export async function executeDescribeSegment(
 
   return {
     ok: true,
-    result: { description: text, model: DESCRIBE_MODEL, start: input.start, end: input.end, cached: false },
+    result: { description: text, model: DESCRIBE_MODEL, start: start, end: end, cached: false },
     stateUpdate,
   };
 }

@@ -9,7 +9,10 @@ import { createSession } from "./session.js";
 // optional, so pre-v4 projects load unchanged — every existing clip simply has
 // no user label. No field transforms are needed; the bump records the schema
 // change and lets older readers reject files they don't understand.
-const SUPPORTED_VERSION = 4;
+//
+// v5: the timeline gained an optional `overlays` track (picture-in-picture
+// layers). Additive — pre-v5 projects load with no overlays.
+const SUPPORTED_VERSION = 5;
 
 // ── Create ────────────────────────────────────────────────────────────────────
 
@@ -72,7 +75,7 @@ export async function loadProject(filePath: string): Promise<ProjectSession> {
   }
 
   const version = file["version"] as number;
-  if (version !== 1 && version !== 2 && version !== 3 && version !== 4) {
+  if (![1, 2, 3, 4, 5].includes(version)) {
     throw new Error(`Unsupported project version ${version} (expected ${SUPPORTED_VERSION})`);
   }
 
@@ -123,8 +126,14 @@ function extractState(file: Record<string, unknown>): ProjectState {
     createdAt: file["createdAt"] as string,
     updatedAt: file["updatedAt"] as string,
     sources: ensureAnalyses(file["sources"] as SourceFile[]),
-    timeline: file["timeline"] as Timeline,
+    timeline: ensureOverlays(file["timeline"] as Timeline),
   };
+}
+
+// Pre-v5 timelines have no overlay track. Normalize to an empty one so the
+// in-memory shape is uniform (readers still go through overlaysOf()).
+function ensureOverlays(timeline: Timeline): Timeline {
+  return Array.isArray(timeline.overlays) ? timeline : { ...timeline, overlays: [] };
 }
 
 // v1/v2 sources have no `analyses` field. Default to `{}` so callers can

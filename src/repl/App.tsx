@@ -60,9 +60,13 @@ export function App() {
   // `previewActive` reroutes Ctrl-C from "exit" to "cancel the render".
   const [previewStatus, setPreviewStatus]   = useState<string | null>(null);
   const [previewActive, setPreviewActive]   = useState<boolean>(false);
+  // `/preview --term`: timg owns the screen while this is set. Ink must not
+  // redraw underneath it, so the spinner (the only idle-time state churn)
+  // pauses; q / Ctrl-C route to the preview abort controller.
+  const [playbackActive, setPlaybackActive] = useState<boolean>(false);
   const previewAbortRef = useRef<AbortController | null>(null);
   // One shared animation ticker for every animated glyph (3I, decision 5).
-  const spinner = useSpinnerFrame(turnActive || previewActive);
+  const spinner = useSpinnerFrame((turnActive || previewActive) && !playbackActive);
   // 3K: queued type-ahead (state for render, ref for reads inside async flows),
   // Ctrl+R tool-detail expansion, and the bounded per-turn detail store.
   const [queue, setQueue]               = useState<InputQueue>(EMPTY_QUEUE);
@@ -271,12 +275,24 @@ export function App() {
         setPreviewActive(true);
         setPendingEntry({ id: pendingId, input: trimmed, output: `rendering preview… ${pct}%`, isError: false });
       },
+      onPreviewPlayback: async (playing) => {
+        setPreviewActive(true);
+        setPlaybackActive(playing);
+        setPendingEntry({
+          id: pendingId, input: trimmed, isError: false,
+          output: playing ? "playing in terminal…  q / ctrl-c to stop" : "preview finished",
+        });
+        // Let Ink flush this frame before timg takes the alternate screen —
+        // a redraw landing mid-handoff would paint over the video.
+        await new Promise((r) => setTimeout(r, playing ? 80 : 0));
+      },
     });
 
     // Finalize: drop the ephemeral live view and commit the loop's final output
     // once as static history (streamed text was shown live, not committed).
     previewAbortRef.current = null;
     setPreviewActive(false);
+    setPlaybackActive(false);
     setLiveTurn(null);
     setTurnActive(false);
     setPendingEntry(null);
@@ -420,6 +436,7 @@ export function App() {
         onConfirmAnswer={handleConfirmAnswer}
         onConfirmPreview={() => { void handleConfirmPreview(); }}
         previewActive={previewActive}
+        playbackActive={playbackActive}
         onPreviewCancel={handlePreviewCancel}
         disabled={turnActive}
         spinner={spinner}

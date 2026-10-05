@@ -1,5 +1,6 @@
-import type { ProjectSession } from "../project/session.js";
-import { applyPlan } from "../project/session.js";
+import type { ProjectSession, Operation } from "../project/session.js";
+import { applyPlan, applyOperations } from "../project/session.js";
+import { lintStory } from "./story-lint.js";
 import { staticSystemPrefix, stateSnapshotSegment } from "./prompt.js";
 import { buildDefaultRegistry, type ToolRegistry } from "./registry.js";
 import { buildDefaultProvider } from "./providers/default.js";
@@ -16,6 +17,7 @@ import {
   type PlanForConfirmation,
 } from "./propose_edit_plan.js";
 import { runCritic, type CriticConcern, type CriticInput, type CriticVerdict } from "./critic.js";
+import { evidenceFrom, type EvidenceItem } from "./evidence.js";
 import type { ContentMap } from "./content-map.js";
 
 const MAX_TOOL_CALLS_PER_TURN = 25;
@@ -32,7 +34,13 @@ export const MAX_CRITIC_REVISIONS = 2;
 // Thinking tokens count toward the output budget. At 4096, reasoning on a hard
 // request eats the budget and truncates the plan mid-response. Sized to leave
 // room for both the reasoning and the answer. Provider-agnostic.
-const MAX_TOKENS = 16000;
+//
+// Story edits (a tightened spine with many kept ranges plus several anchored
+// cutaways) produce long plans: a real run truncated at 16000 with nothing
+// applied. 32000 is the normal budget; a truncated turn is retried ONCE at
+// MAX_TOKENS_RETRY before giving up.
+const MAX_TOKENS = 32000;
+const MAX_TOKENS_RETRY = 64000;
 
 // Neutral block aliases — the loop works exclusively in these.
 type ToolUseBlock = Extract<ContentBlock, { type: "tool_use" }>;
@@ -100,6 +108,8 @@ interface AgentState {
   assistantText: string[];       // accumulated text replies for the final output summary
   surveyed: boolean;             // 3G: survey_sources ran this turn (critic threshold input)
   lastContentMap: ContentMap | null; // 3G: the most recent survey's map, handed to the critic
+  evidence: EvidenceItem[];      // perception results this turn, handed to the critic
+  storyChecked: boolean;         // the deterministic story check already spoke this turn
   criticRevisions: number;       // 3G: revision rounds consumed (capped at MAX_CRITIC_REVISIONS)
 }
 
@@ -128,6 +138,8 @@ export async function runAgent(input: AgentInput): Promise<AgentResult> {
     assistantText: [],
     surveyed: false,
     lastContentMap: null,
+    evidence: [],
+    storyChecked: false,
     criticRevisions: 0,
   };
 
@@ -148,12 +160,14 @@ export async function runAgent(input: AgentInput): Promise<AgentResult> {
     // and thinking render token-by-token via deltas; tool calls surface as a
     // name-only indicator — never streamed input JSON.
     let response: ChatResponse;
+    let budget = MAX_TOKENS;
+    for (let attempt = 0; ; attempt++) {
     try {
       const streaming = provider.stream({
         system,
         messages: state.messages,
         tools,
-        maxTokens: MAX_TOKENS,
+        maxTokens: budget,
         // Always-on reasoning. The provider maps this to adaptive thinking; the
         // model decides per turn whether/how much to think (adaptive skips it on
         // simple edits). No Anthropic-specific handling reaches this file.
@@ -170,6 +184,14 @@ export async function runAgent(input: AgentInput): Promise<AgentResult> {
       response = await streaming.finalResponse();
     } catch (err: unknown) {
       return finalize(state, `Agent error: ${(err as Error).message}`, true);
+    }
+    // A truncated turn is discarded (never appended — a half-written tool call
+    // is not valid history) and re-asked once with a larger budget.
+    if (response.stopReason === "max_output" && attempt === 0) {
+      budget = MAX_TOKENS_RETRY;
+      continue;
+    }
+    break;
     }
 
     // Append the assistant's response verbatim. Content may include text,
@@ -340,6 +362,8 @@ async function dispatchToolUse(
   if (tu.name === "survey_sources") {
     nextState = { ...nextState, surveyed: true, lastContentMap: outcome.result as ContentMap };
   }
+  const observed = evidenceFrom(tu.name, tu.input, outcome.result, state.session.state);
+  if (observed) nextState = { ...nextState, evidence: [...nextState.evidence, observed] };
 
   return {
     state: nextState,
@@ -395,6 +419,34 @@ async function handleProposePlan(
     }
   }
 
+  // ── Deterministic story check (before the critic and the user) ────────────
+  // Catches a dialogue source cut off mid-conversation with another source's
+  // sound playing after it (story-lint.ts). Speaks once per turn: re-proposing
+  // the same plan after reading it is the director's way of saying "intended".
+  if (!state.storyChecked) {
+    const scratch = applyOperations(state.session.state, parsed.data.operations as Operation[]);
+    const issues = scratch.ok ? lintStory(scratch.state) : [];
+    if (issues.length > 0) {
+      const detail = { status: "check", issues: issues.map((i) => i.message) };
+      input.onProgress?.({ type: "tool_result", name: tu.name, ok: true, durationMs: Date.now() - startMs, detail });
+      return {
+        state: { ...state, storyChecked: true },
+        result: {
+          type: "tool_result",
+          toolUseId: tu.id,
+          content: JSON.stringify({
+            ...detail,
+            instruction:
+              "Nothing was applied. Check these before the plan goes to review. If keeping the dialogue " +
+              "running is the better story, revise the plan and call propose_edit_plan again. If stopping " +
+              "there is genuinely what the user asked for, call propose_edit_plan again with the same plan.",
+          }),
+        },
+        stopAfterThisRound: false,
+      };
+    }
+  }
+
   let plan = renderPlanForConfirmation(state.session.state, parsed.data);
 
   // ── Critic review, BEFORE the user sees the plan (3G, decision 1) ──────────
@@ -410,6 +462,7 @@ async function handleProposePlan(
       review = await critic({
         userRequest: lastUserPromptFrom(state.messages),
         contentMap: state.lastContentMap,
+        evidence: state.evidence,
         plan: { summary: parsed.data.summary, operations: parsed.data.operations },
         renderedPlan: plan.renderedLines,
         timelineState: state.session.state,

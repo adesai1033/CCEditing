@@ -83,6 +83,8 @@ export const glyphs = {
   enter: "↵",
   clippedLeft: "◀",
   clippedRight: "▶",
+  transition: "╪",
+  fade: "◐",
 } as const;
 
 // One shared ticker drives every animation (decision 5): few frames, slow

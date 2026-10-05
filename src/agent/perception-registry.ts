@@ -8,6 +8,7 @@ import { findVisualMoment } from "./tools/find_visual_moment.js";
 import { detectScenes } from "./tools/detect_scenes.js";
 import { transcribeAudio } from "./tools/transcribe_audio.js";
 import { detectSilence } from "./tools/detect_silence.js";
+import { mapVisualBeatsTool } from "./tools/map_visual_beats.js";
 
 // NOTE: this module is on the SCOUT path and must stay write-free — it imports
 // no write function and no propose_edit_plan. Terminal schemas (propose) are
@@ -105,5 +106,6 @@ export function buildPerceptionRegistry(): ToolRegistry {
   r.register(detectScenes);
   r.register(transcribeAudio);
   r.register(detectSilence);
+  r.register(mapVisualBeatsTool);
   return r;
 }

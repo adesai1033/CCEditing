@@ -1,6 +1,4 @@
 import path from "node:path";
-import os from "node:os";
-import { mkdir, unlink } from "node:fs/promises";
 import type { NeutralMessage } from "../../agent/providers/types.js";
 import type { ViewportState } from "../../display/timeline.js";
 import { buildHelpText } from "./registry.js";
@@ -20,7 +18,9 @@ import { getDefaultIndexRegistry } from "../../agent/indexing.js";
 import { paint, glyphs } from "../../ui/theme.js";
 import { loadOrCreateProject, saveProjectToStandardPath } from "../../cli/project-context.js";
 import { parseTime } from "../../utils/time.js";
-import { execute } from "../../engine/engine.js";
+import { exportTimeline } from "../../engine/export.js";
+import { runOverlayCommand } from "./overlay.js";
+import { runTransitionCommand, runFadeCommand, type EdgeCommandResult } from "./transition.js";
 import { runAgent, type AgentInput, type ProgressEvent } from "../../agent/loop.js";
 import type { PlanForConfirmation } from "../../agent/propose_edit_plan.js";
 import { parsePreviewArgs, previewStateScope, type PreviewDeps } from "./preview.js";
@@ -67,8 +67,10 @@ export interface DispatchOptions {
   onPreviewProgress?: (percent: number) => void;
   /** Abort signal for /preview renders (Ctrl-C cancels, decision 6). */
   previewSignal?: AbortSignal;
+  /** `/preview --term`: inline playback is about to take / has released the screen. */
+  onPreviewPlayback?: (playing: boolean) => void | Promise<void>;
   /** Injected for tests — preview render/player seams (defaults are real). */
-  previewDeps?: Pick<PreviewDeps, "render" | "open">;
+  previewDeps?: Pick<PreviewDeps, "render" | "open" | "play">;
   /** Injected for tests — defaults to compactHistory (3E-8). */
   compact?: typeof compactHistory;
   /** Injected for tests — defaults to runAgent. */
@@ -110,6 +112,10 @@ async function route(
   const [token, ...args] = trimmed.slice(1).split(/\s+/);
   const cmd = token?.toLowerCase();
 
+  if ((cmd === "transition" || cmd === "fade") && !state.session) {
+    return { output: "No project open. Use /open first.", isError: true };
+  }
+
   switch (cmd) {
     case "help":     return { output: buildHelpText(), isError: false };
     case "quit":     return { output: "Goodbye.", isError: false, shouldExit: true };
@@ -121,6 +127,9 @@ async function route(
     case "delete":   return withSlashContinuity(await dispatchDelete(args, state), state);
     case "label":    return withSlashContinuity(await dispatchLabel(args, state), state);
     case "unlabel":  return withSlashContinuity(await dispatchUnlabel(args, state), state);
+    case "overlay":  return withSlashContinuity(await dispatchOverlay(args, state), state);
+    case "transition": return withSlashContinuity(await dispatchEdge(runTransitionCommand(args, state.session!), state), state);
+    case "fade":     return withSlashContinuity(await dispatchEdge(runFadeCommand(args, state.session!), state), state);
     case "undo":     return withSlashContinuity(await dispatchUndo(state), state);
     case "redo":     return withSlashContinuity(await dispatchRedo(state), state);
     case "export":   return dispatchExport(args, state);
@@ -451,6 +460,17 @@ async function dispatchUnlabel(args: string[], state: ReplState): Promise<Dispat
   };
 }
 
+// ── /transition & /fade ───────────────────────────────────────────────────────
+//
+// Edge effects (transition.ts, shared with the CLI): persist and adapt.
+
+async function dispatchEdge(r: EdgeCommandResult, state: ReplState): Promise<DispatchResult> {
+  if (r.isError || !r.session) return { output: r.output, isError: r.isError };
+  const saved = await saveProjectToStandardPath(r.session);
+  if (!saved.ok) return { output: `Error saving project: ${saved.error}`, isError: true };
+  return { output: r.output, isError: false, newState: { ...state, session: r.session } };
+}
+
 // ── /undo ─────────────────────────────────────────────────────────────────────
 
 async function dispatchUndo(state: ReplState): Promise<DispatchResult> {
@@ -496,54 +516,32 @@ async function dispatchExport(args: string[], state: ReplState): Promise<Dispatc
   const clips = clipsInOrder(state.session.state.timeline);
   if (clips.length === 0) return { output: "Timeline is empty. Use /open to add clips.", isError: true };
 
-  const outputPath = path.resolve(args[0]);
-  const sourceMap = new Map(state.session.state.sources.map((s) => [s.id, s]));
+  const result = await exportTimeline(state.session.state, path.resolve(args[0]));
+  if (!result.ok) return { output: `Export failed: ${result.error}`, isError: true };
 
-  // Single clip — direct trim
-  if (clips.length === 1) {
-    const clip = clips[0]!;
-    const source = sourceMap.get(clip.sourceId);
-    if (!source) return { output: "Source file missing for clip [1].", isError: true };
-
-    const result = await execute({ type: "trim", input: source.filePath, start: clip.inPoint, end: clip.outPoint, output: outputPath });
-    if (!result.ok) return { output: `Export failed: ${result.error}`, isError: true };
-
-    return {
-      output: `Exported: ${outputPath}\nSize: ${formatFileSize(result.outputSize)}\nDuration: ${formatDuration(clip.outPoint - clip.inPoint)}`,
-      isError: false,
-    };
-  }
-
-  // Multi-clip — trim each to temp, then concat
-  const tmpDir = path.join(os.tmpdir(), `cutcli-export-${Date.now()}`);
-  await mkdir(tmpDir, { recursive: true });
-  const segPaths: string[] = [];
-
-  for (let i = 0; i < clips.length; i++) {
-    const clip = clips[i]!;
-    const source = sourceMap.get(clip.sourceId);
-    if (!source) {
-      await cleanupSegments(segPaths);
-      return { output: `Source file missing for clip [${i + 1}].`, isError: true };
-    }
-    const seg = path.join(tmpDir, `seg-${String(i).padStart(3, "0")}.mp4`);
-    const r = await execute({ type: "trim", input: source.filePath, start: clip.inPoint, end: clip.outPoint, output: seg });
-    if (!r.ok) {
-      await cleanupSegments(segPaths);
-      return { output: `Trim failed for clip [${i + 1}]: ${r.error}`, isError: true };
-    }
-    segPaths.push(seg);
-  }
-
-  const concat = await execute({ type: "concat", segments: segPaths, output: outputPath });
-  await cleanupSegments(segPaths);
-  if (!concat.ok) return { output: `Concat failed: ${concat.error}`, isError: true };
-
-  const total = clips.reduce((s, c) => s + (c.outPoint - c.inPoint), 0);
+  const parts: string[] = [];
+  if (result.clipCount > 1) parts.push(`${result.clipCount} clips`);
+  if (result.overlayCount > 0) parts.push(`${result.overlayCount} overlay${result.overlayCount === 1 ? "" : "s"}`);
+  const suffix = parts.length > 0 ? `  (${parts.join(", ")})` : "";
   return {
-    output: `Exported: ${outputPath}\nSize: ${formatFileSize(concat.outputSize)}\nDuration: ${formatDuration(total)}  (${clips.length} clips)`,
+    output: `Exported: ${result.outputPath}\nSize: ${formatFileSize(result.outputSize)}\nDuration: ${formatDuration(result.duration)}${suffix}`,
     isError: false,
   };
+}
+
+// ── /overlay ──────────────────────────────────────────────────────────────────
+//
+// The picture-in-picture track. Parsing and application live in overlay.ts
+// (shared with the CLI); this just persists and adapts the result shape.
+
+async function dispatchOverlay(args: string[], state: ReplState): Promise<DispatchResult> {
+  if (!state.session) return { output: "No project open. Use /open first.", isError: true };
+  const r = await runOverlayCommand(args, state.session);
+  if (r.isError || !r.session) return { output: r.output, isError: r.isError };
+
+  const saved = await saveProjectToStandardPath(r.session);
+  if (!saved.ok) return { output: `Error saving project: ${saved.error}`, isError: true };
+  return { output: r.output, isError: false, newState: { ...state, session: r.session } };
 }
 
 // ── /preview ──────────────────────────────────────────────────────────────────
@@ -565,6 +563,8 @@ async function dispatchPreview(
   const outcome = await previewStateScope(state.session.state, parsed.scope, {
     onProgress: options.onPreviewProgress,
     signal: options.previewSignal,
+    terminal: parsed.terminal,
+    onPlayback: options.onPreviewPlayback,
     ...options.previewDeps,
   });
 
@@ -784,10 +784,6 @@ async function dispatchAgent(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-async function cleanupSegments(paths: string[]): Promise<void> {
-  await Promise.all(paths.map((p) => unlink(p).catch(() => {})));
-}
 
 function formatDuration(seconds: number): string {
   const h = Math.floor(seconds / 3600);

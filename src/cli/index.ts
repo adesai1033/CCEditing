@@ -3,13 +3,13 @@ import "../utils/env.js"; // must stay first — populates process.env from .env
 import { Command } from "commander";
 import chalk from "chalk";
 import path from "node:path";
-import os from "node:os";
-import { mkdir, rename, unlink } from "node:fs/promises";
 import { probeFile } from "../media/probe.js";
 import { renderMediaInfo } from "../display/media-info.js";
 import { renderTimeline } from "../display/timeline.js";
 import { renderClipList } from "../display/timeline-clip-list.js";
-import { execute } from "../engine/engine.js";
+import { exportTimeline } from "../engine/export.js";
+import { runOverlayCommand, OVERLAY_USAGE } from "../repl/commands/overlay.js";
+import { runTransitionCommand, runFadeCommand, TRANSITION_USAGE, FADE_USAGE, type EdgeCommandResult } from "../repl/commands/transition.js";
 import { parseTime } from "../utils/time.js";
 import { clipsInOrder, resolveClip, getClipDisplayRefs } from "../project/types.js";
 import { applyPlan, undoSession, redoSession, type ProjectSession } from "../project/session.js";
@@ -315,6 +315,67 @@ program
     }
   });
 
+// ── overlay ───────────────────────────────────────────────────────────────────
+
+program
+  .command("overlay [args...]")
+  .description("Picture-in-picture: overlay a video on the timeline, sized and placed anywhere")
+  .allowUnknownOption(true)
+  .addHelpText("after", "\n" + OVERLAY_USAGE.replace(/\/overlay/g, "cutcli overlay"))
+  .action(async (args: string[]) => {
+    const session = await requireProject();
+    const r = await runOverlayCommand(args, session);
+    if (r.isError) {
+      console.error(chalk.red(r.output));
+      process.exit(1);
+    }
+    if (r.session) await saveOrExit(r.session);
+    console.log();
+    console.log(r.output);
+    console.log();
+    if (r.session) {
+      console.log(renderClipList(r.session.state));
+      console.log();
+    }
+  });
+
+// ── transition / fade ─────────────────────────────────────────────────────────
+
+async function finishEdge(r: EdgeCommandResult): Promise<void> {
+  if (r.isError) {
+    console.error(chalk.red(r.output));
+    process.exit(1);
+  }
+  if (r.session) await saveOrExit(r.session);
+  console.log();
+  console.log(r.output);
+  console.log();
+  if (r.session) {
+    console.log(renderTimeline(r.session.state, process.stdout.columns));
+    console.log();
+    console.log(renderClipList(r.session.state));
+    console.log();
+  }
+}
+
+program
+  .command("transition [args...]")
+  .description("Crossfade from a clip into the next one (or `all`); `none` restores a hard cut")
+  .addHelpText("after", "\n" + TRANSITION_USAGE.replace(/\/transition/g, "cutcli transition"))
+  .action(async (args: string[]) => {
+    const session = await requireProject();
+    await finishEdge(runTransitionCommand(args, session));
+  });
+
+program
+  .command("fade [args...]")
+  .description("Fade a clip in from black or out to black")
+  .addHelpText("after", "\n" + FADE_USAGE.replace(/\/fade/g, "cutcli fade"))
+  .action(async (args: string[]) => {
+    const session = await requireProject();
+    await finishEdge(runFadeCommand(args, session));
+  });
+
 // ── export ────────────────────────────────────────────────────────────────────
 
 program
@@ -331,78 +392,33 @@ program
       process.exit(1);
     }
 
-    const sourceMap = new Map(state.sources.map((s) => [s.id, s]));
-    const absOutput = path.resolve(output);
-    const tmpDirPath = path.join(os.tmpdir(), `cutcli-export-${Date.now()}`);
-    await mkdir(tmpDirPath, { recursive: true });
-    const tmpDir = tmpDirPath;
-
     console.log();
     console.log(`Exporting ${clips.length} clip${clips.length === 1 ? "" : "s"}...`);
     console.log();
 
-    const segmentPaths: string[] = [];
+    const result = await exportTimeline(state, path.resolve(output), {
+      onStep: (step) => {
+        if (step.kind === "trim") process.stdout.write(`  [${step.index + 1}/${step.total}] Trimming ${step.detail}...`);
+        else if (step.kind === "concat") process.stdout.write("  Concatenating segments...");
+        else if (step.kind === "join") process.stdout.write(`  Joining with ${step.detail}...`);
+        else process.stdout.write(`  Compositing ${step.detail}...`);
+      },
+      onStepDone: () => process.stdout.write(chalk.green("  done\n")),
+    });
 
-    for (let i = 0; i < clips.length; i++) {
-      const clip = clips[i]!;
-      const source = sourceMap.get(clip.sourceId);
-      if (!source) {
-        console.error(chalk.red(`Error: Source file missing for clip [${i + 1}]: ${clip.sourceId}`));
-        await cleanupSegments(segmentPaths);
-        process.exit(1);
-      }
-
-      const segPath = path.join(tmpDir, `segment-${String(i).padStart(3, "0")}.mp4`);
-      process.stdout.write(`  [${i + 1}/${clips.length}] Trimming ${source.fileName} (${formatDuration(clip.inPoint)} → ${formatDuration(clip.outPoint)})...`);
-
-      const result = await execute({
-        type: "trim",
-        input: source.filePath,
-        start: clip.inPoint,
-        end: clip.outPoint,
-        output: segPath,
-      });
-
-      if (!result.ok) {
-        process.stdout.write("  failed\n");
-        console.error(chalk.red(`Error: ${result.error}`));
-        await cleanupSegments(segmentPaths);
-        process.exit(1);
-      }
-
-      segmentPaths.push(segPath);
-      process.stdout.write(chalk.green("  done\n"));
+    if (!result.ok) {
+      process.stdout.write("  failed\n");
+      console.error(chalk.red(`Error: ${result.error}`));
+      process.exit(1);
     }
 
-    let finalSize: number;
-
-    if (segmentPaths.length === 1) {
-      await rename(segmentPaths[0]!, absOutput);
-      const { stat } = await import("node:fs/promises");
-      finalSize = (await stat(absOutput)).size;
-    } else {
-      process.stdout.write("  Concatenating segments...");
-      const concatResult = await execute({
-        type: "concat",
-        segments: segmentPaths,
-        output: absOutput,
-      });
-      if (!concatResult.ok) {
-        process.stdout.write("  failed\n");
-        console.error(chalk.red(`Error: ${concatResult.error}`));
-        await cleanupSegments(segmentPaths);
-        process.exit(1);
-      }
-      finalSize = concatResult.outputSize;
-      process.stdout.write(chalk.green("  done\n"));
-      await cleanupSegments(segmentPaths);
-    }
-
-    const totalDuration = clips.reduce((sum, c) => sum + (c.outPoint - c.inPoint), 0);
+    const extras: string[] = [];
+    if (result.clipCount > 1) extras.push(`${result.clipCount} clips`);
+    if (result.overlayCount > 0) extras.push(`${result.overlayCount} overlay${result.overlayCount === 1 ? "" : "s"}`);
     console.log();
     console.log(chalk.green(`✓ Exported successfully`));
-    console.log(chalk.dim(`  Output    ${absOutput} (${formatFileSize(finalSize)})`));
-    console.log(chalk.dim(`  Duration  ${formatDuration(totalDuration)}${clips.length > 1 ? `  (${clips.length} clips)` : ""}`));
+    console.log(chalk.dim(`  Output    ${result.outputPath} (${formatFileSize(result.outputSize)})`));
+    console.log(chalk.dim(`  Duration  ${formatDuration(result.duration)}${extras.length > 0 ? `  (${extras.join(", ")})` : ""}`));
     console.log();
   });
 
@@ -458,8 +474,4 @@ function formatSeconds(seconds: number): string {
   if (m > 0) parts.push(`${m}m`);
   if (s > 0 || parts.length === 0) parts.push(`${s}s`);
   return parts.join("");
-}
-
-async function cleanupSegments(paths: string[]): Promise<void> {
-  await Promise.all(paths.map((p) => unlink(p).catch(() => {})));
 }

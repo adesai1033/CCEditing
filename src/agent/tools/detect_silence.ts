@@ -32,13 +32,22 @@ export interface DetectSilenceOutput {
 
 type FfmpegRunner = (input: string, thresholdDb: number, minDuration: number) => Promise<string>;
 
-async function runFfmpeg(input: string, thresholdDb: number, minDuration: number): Promise<string> {
-  const args = [
+/** Exposed for testing. */
+export function buildSilenceArgs(input: string, thresholdDb: number, minDuration: number): string[] {
+  return [
+    "-nostdin", "-hide_banner",
     "-i", input,
+    // Audio only. Without -vn ffmpeg also decodes every video frame to the
+    // null muxer: 137s instead of 0.16s on a 4K/60fps HEVC phone video.
+    "-vn", "-sn", "-dn",
     "-af", `silencedetect=noise=${thresholdDb}dB:d=${minDuration}`,
     "-f", "null",
     "-",
   ];
+}
+
+async function runFfmpeg(input: string, thresholdDb: number, minDuration: number): Promise<string> {
+  const args = buildSilenceArgs(input, thresholdDb, minDuration);
   try {
     const { stderr } = await execFileAsync("ffmpeg", args);
     return stderr;

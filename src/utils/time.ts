@@ -53,13 +53,16 @@ export function parseTime(input: string): number {
  *   90.5   → "1:30.5"
  */
 export function formatTime(seconds: number): string {
+  // Round to tenths first so 61.98 carries to "1:02" rather than "1:01.10".
+  seconds = Math.round(seconds * 10) / 10;
   const totalSecs = Math.floor(seconds);
   const frac = seconds - totalSecs;
   const h = Math.floor(totalSecs / 3600);
   const m = Math.floor((totalSecs % 3600) / 60);
   const s = totalSecs % 60;
 
-  const fracStr = frac > 0 ? `.${String(Math.round(frac * 10))}` : "";
+  const fracDigit = Math.round(frac * 10);
+  const fracStr = fracDigit > 0 ? `.${fracDigit}` : "";
   const secStr = String(s).padStart(2, "0") + fracStr;
 
   if (h > 0) {

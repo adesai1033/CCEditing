@@ -1,5 +1,5 @@
 import type { ProjectState, Clip } from "../project/types.js";
-import { clipsInOrder } from "../project/types.js";
+import { clipsInOrder, layoutTimeline } from "../project/types.js";
 import { paint, clipPaint, glyphs, stripAnsi } from "../ui/theme.js";
 
 // ── Constants ──────────────────────────────────────────────────────────────────
@@ -63,10 +63,6 @@ function formatTotal(seconds: number): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
-function clipDuration(clip: Clip): number {
-  return clip.outPoint - clip.inPoint;
-}
-
 function truncateLabel(label: string, width: number): string {
   if (width <= 0) return "";
   if (width === 1) return "─";
@@ -76,15 +72,22 @@ function truncateLabel(label: string, width: number): string {
   return label.slice(0, width - 3) + "…";
 }
 
-/** Returns the absolute start time of each clip on the timeline. */
-function computeClipPositions(clips: Clip[]): number[] {
-  const positions: number[] = [];
-  let t = 0;
-  for (const clip of clips) {
-    positions.push(t);
-    t += clipDuration(clip);
-  }
-  return positions;
+/**
+ * Each clip's span of the bar: from its timeline start to the next clip's
+ * start (crossfaded neighbours overlap, and the overlap is drawn as part of
+ * the earlier clip so spans tile the bar exactly). `transitionIn` marks a
+ * boundary that is a transition rather than a cut.
+ */
+interface ClipSpan { start: number; end: number; transitionIn: boolean }
+
+function computeClipSpans(timeline: Parameters<typeof layoutTimeline>[0]): { spans: ClipSpan[]; total: number } {
+  const layout = layoutTimeline(timeline);
+  const spans = layout.clips.map((p, i) => {
+    const next = layout.clips[i + 1];
+    const prev = layout.clips[i - 1];
+    return { start: p.start, end: next ? next.start : p.end, transitionIn: prev?.transitionOut !== null && prev !== undefined };
+  });
+  return { spans, total: layout.duration };
 }
 
 /**
@@ -115,7 +118,7 @@ function clipViewportSlice(
  */
 function buildViewportGroups(
   clips: Clip[],
-  positions: number[],
+  spans: ClipSpan[],
   vStart: number,
   vEnd: number,
   barWidth: number,
@@ -129,8 +132,8 @@ function buildViewportGroups(
 
   for (let i = 0; i < clips.length; i++) {
     const clip  = clips[i]!;
-    const start = positions[i]!;
-    const end   = start + clipDuration(clip);
+    const start = spans[i]!.start;
+    const end   = spans[i]!.end;
     const slice = clipViewportSlice(start, end, vStart, vEnd);
 
     if (!slice.visible) {
@@ -288,7 +291,7 @@ export function renderTimeline(
     return [box.top, box.row(paint.muted("No clips on timeline")), box.bottom].join("\n");
   }
 
-  const totalDuration = clips.reduce((sum, c) => sum + clipDuration(c), 0);
+  const { spans, total: totalDuration } = computeClipSpans(state.timeline);
 
   if (totalDuration === 0) {
     return [box.top, box.row(paint.muted("No clips on timeline")), box.bottom].join("\n");
@@ -300,9 +303,8 @@ export function renderTimeline(
   const vEnd      = vStart + vDuration;
 
   // Build groups visible within the viewport
-  const positions = computeClipPositions(clips);
   const { groups, offScreenLeft, offScreenRight } = buildViewportGroups(
-    clips, positions, vStart, vEnd, barWidth,
+    clips, spans, vStart, vEnd, barWidth,
   );
 
   if (groups.length === 0) {
@@ -350,7 +352,8 @@ export function renderTimeline(
   groups.forEach((group, idx) => {
     const w     = widths[idx]!;
     const color = clipPaint(group.colorIndex);
-    const border = color("│");
+    // A boundary that is a transition (not a cut) gets its own glyph.
+    const border = color(idx > 0 && spans[group.colorIndex]?.transitionIn && !group.clippedLeft ? glyphs.transition : "│");
 
     if (w === 1) {
       clipBar += border;
