@@ -374,7 +374,7 @@ describe("renderPreviewFromSegments with transitions", () => {
     return { runner, calls };
   }
 
-  test("uses the filter join (preview knobs) instead of the stream copy, probing the first segment", async () => {
+  test("uses the filter join (preview knobs) instead of the stream copy, probing the segments", async () => {
     const dir = mkdtempSync(join(workRoot, "pv-"));
     const src = join(dir, "src.mp4");
     writeFileSync(src, "dummy");
@@ -396,8 +396,8 @@ describe("renderPreviewFromSegments with transitions", () => {
     assert.ok(joinArgs.includes("-filter_complex"));
     assert.match(joinArgs[joinArgs.indexOf("-filter_complex") + 1]!, /xfade=transition=fade:duration=1:offset=3/);
     assert.equal(joinArgs[joinArgs.indexOf("-preset") + 1], "ultrafast");
-    assert.equal(probed.length, 1);
-    assert.ok(probed[0]!.endsWith(".mp4") && probed[0]!.includes("segments"), "the first trimmed segment sets the target");
+    assert.equal(probed.length, 2, "every trimmed segment is probed; the largest sets the target");
+    assert.ok(probed.every((p) => p.endsWith(".mp4") && p.includes("segments")));
     assert.equal(progress[progress.length - 1], 100);
     assert.ok(progress.every((p, i) => i === 0 || p >= progress[i - 1]!), "monotonic");
   });
@@ -661,5 +661,19 @@ describe("mixed source formats", () => {
     );
     assert.ok(r.ok);
     assert.deepEqual(calls[calls.length - 1]!.slice(0, 2), ["-f", "concat"]);
+  });
+});
+
+// ── Conform target: never downscale to a smaller first clip ───────────────────
+
+import { conformTarget } from "../engine/ffmpeg.js";
+
+describe("conform target", () => {
+  test("the join conforms to the largest segment and the highest frame rate, not the first", () => {
+    assert.deepEqual(
+      conformTarget([{ width: 1920, height: 1080, fps: 30 }, { width: 3840, height: 2160, fps: 59.94 }, { width: 3456, height: 2234, fps: 60 }]),
+      { width: 3840, height: 2160, fps: 60 },
+    );
+    assert.deepEqual(conformTarget([{ width: 854, height: 480, fps: 0 }]), { width: 854, height: 480, fps: 30 });
   });
 });

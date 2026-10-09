@@ -160,7 +160,9 @@ export function renderPlanForConfirmation(
         return `Split clip [${ref(op.clipId)}] ${refLabel(op.clipId)} at ${formatTime(op.splitPoint)}${named}`;
       }
       case "move":
-        return `Move clip [${ref(op.clipId)}] ${refLabel(op.clipId)} → position ${op.newIndex + 1}`;
+        return op.atSource
+          ? `Move clip [${ref(op.clipId)}] ${refLabel(op.clipId)} → where ${sourceMap.get(op.atSource.sourceId)?.fileName ?? "(unknown source)"} reaches ${formatTime(op.atSource.time)}`
+          : `Move clip [${ref(op.clipId)}] ${refLabel(op.clipId)} → position ${(op.newIndex ?? 0) + 1}`;
       case "delete":
         return `Delete clip [${ref(op.clipId)}] ${refLabel(op.clipId)}`;
       case "addOverlay": {
@@ -176,10 +178,15 @@ export function renderPlanForConfirmation(
         return `Remove overlay [${oRef(op.overlayId)}] ${oLabel(op.overlayId)}`;
       case "insertClip": {
         const src = sourceMap.get(op.sourceId)?.fileName ?? "(unknown source)";
-        return `Insert ${src} ${formatTime(op.inPoint)}–${formatTime(op.outPoint)} → position ${op.index + 1}`;
+        const where = op.atSource
+          ? `where ${sourceMap.get(op.atSource.sourceId)?.fileName ?? "(unknown source)"} reaches ${formatTime(op.atSource.time)}`
+          : `position ${(op.index ?? 0) + 1}`;
+        return `Insert ${src} ${formatTime(op.inPoint)}–${formatTime(op.outPoint)} → ${where}`;
       }
       case "keepRanges": {
-        const clip = clipMap.get(op.clipId) ?? afterClips[op.clipId];
+        // Only a clip that exists before the plan has a known "before" length;
+        // one created earlier in the same plan doesn't (its after-state is a piece).
+        const clip = clipMap.get(op.clipId);
         const before = clip ? clip.outPoint - clip.inPoint : 0;
         const kept = op.ranges.reduce((t, r) => t + (r.end - r.start), 0);
         const removed = before > 0 ? `, ${Math.round(before - kept)}s cut` : "";

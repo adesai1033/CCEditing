@@ -34,6 +34,7 @@ export const SUBMIT_REVIEW_TOOL = "submit_review";
 // Thinking is on (review is a judgment task, decision 7) and counts toward the
 // output budget, so this leaves room for both the reasoning and the verdict.
 const CRITIC_MAX_TOKENS = 8000;
+const CRITIC_EFFORT = "medium" as const;
 
 export interface CriticConcern {
   severity: "minor" | "major";
@@ -132,7 +133,9 @@ export async function runCritic(input: CriticInput, deps: CriticDeps): Promise<C
         messages,
         tools: [submitReviewSchema],
         maxTokens: deps.maxTokens ?? CRITIC_MAX_TOKENS,
-        reasoning: { enabled: true },   // review is a judgment task (decision 7)
+        // Review is a judgment task (decision 7); measured rounds took ~200 s
+        // each at the default effort, so it reasons at medium effort.
+        reasoning: { enabled: true, effort: CRITIC_EFFORT },
         role: "critic",
       });
 
@@ -154,7 +157,12 @@ export async function runCritic(input: CriticInput, deps: CriticDeps): Promise<C
       if (!parsed.success) {
         return failOpen(`verdict failed validation: ${parsed.error.message}`);
       }
-      return { verdict: parsed.data.verdict, concerns: parsed.data.concerns };
+      // Its own rules say "revise" needs a major concern; a revise with only
+      // minor ones would buy a full director + critic round for nothing.
+      const verdict = parsed.data.verdict === "revise" && !parsed.data.concerns.some((c) => c.severity === "major")
+        ? "approve"
+        : parsed.data.verdict;
+      return { verdict, concerns: parsed.data.concerns };
     }
     return failOpen("never called submit_review");
   } catch (err: unknown) {

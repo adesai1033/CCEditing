@@ -5,7 +5,7 @@ import {
   addSource, trimClip, splitClip, reorderClip, removeClip,
   importSource, addOverlay, updateOverlay, removeOverlay,
   setTransition, removeTransition, setFade,
-  timelineTimeOf, insertClip, keepRanges,
+  timelineTimeOf, insertClip, keepRanges, indexAtSource,
 } from "./mutations.js";
 import type { MediaInfo } from "../media/types.js";
 
@@ -63,10 +63,19 @@ export const SplitOpSchema = z.object({
   ),
 });
 
+// Where a clip should cut in, by a moment of another main-track source — e.g.
+// "where elderly.MOV reaches 51.84 s". Resolved after the plan's earlier
+// operations (so it survives keepRanges); splits that clip there if needed.
+const AtSourceSchema = z.object({ sourceId: z.string(), time: z.number() });
+
 export const MoveOpSchema = z.object({
   type: z.literal("move"),
   clipId: z.string(),
-  newIndex: z.number().int(),
+  newIndex: z.number().int().optional().describe("0-based target position. Use this or atSource."),
+  atSource: AtSourceSchema.optional().describe(
+    "Move the clip so it cuts in when this main-track source reaches `time` (splitting that clip there if needed). " +
+    "Prefer it over newIndex when the cut point is a line of dialogue — it is resolved after earlier operations, so tightening can't throw it off.",
+  ),
 });
 
 export const DeleteOpSchema = z.object({
@@ -140,7 +149,10 @@ export const InsertClipOpSchema = z.object({
   sourceId: z.string().describe("Any project source (query_timeline `sources`)."),
   inPoint: z.number(),
   outPoint: z.number(),
-  index: z.number().int().describe("0-based position on the main track; equal to the clip count appends."),
+  index: z.number().int().optional().describe("0-based position on the main track; equal to the clip count appends. Use this or atSource."),
+  atSource: AtSourceSchema.optional().describe(
+    "Insert where this main-track source reaches `time` (splitting that clip there if needed) — robust to earlier tightening.",
+  ),
   newClipId: z.string().optional().describe("Name for the new clip so later operations in this plan can reference it."),
 });
 
@@ -273,8 +285,17 @@ function executeOperation(state: ProjectState, op: Operation): MutationResult {
       return trimClip(state, op.clipId, { inPoint: op.inPoint, outPoint: op.outPoint });
     case "split":
       return splitClip(state, op.clipId, op.splitPoint, op.newClipId);
-    case "move":
-      return reorderClip(state, op.clipId, op.newIndex);
+    case "move": {
+      if ((op.newIndex === undefined) === (op.atSource === undefined)) {
+        return { ok: false, error: "move needs exactly one of newIndex or atSource" };
+      }
+      if (op.newIndex !== undefined) return reorderClip(state, op.clipId, op.newIndex);
+      const pos = indexAtSource(state, op.atSource!.sourceId, op.atSource!.time, op.clipId);
+      if (!pos.ok) return pos;
+      // The index was computed with the moving clip left out, which is exactly
+      // reorderClip's post-removal coordinate system.
+      return reorderClip(pos.state, op.clipId, pos.index);
+    }
     case "delete":
       return removeClip(state, op.clipId);
     case "addOverlay": {
@@ -290,8 +311,15 @@ function executeOperation(state: ProjectState, op: Operation): MutationResult {
       const placement = overlayPlacement(state, op);
       return placement.ok ? updateOverlay(state, op.overlayId, placement.value) : placement;
     }
-    case "insertClip":
-      return insertClip(state, op.sourceId, op.inPoint, op.outPoint, op.index, op.newClipId);
+    case "insertClip": {
+      if ((op.index === undefined) === (op.atSource === undefined)) {
+        return { ok: false, error: "insertClip needs exactly one of index or atSource" };
+      }
+      if (op.index !== undefined) return insertClip(state, op.sourceId, op.inPoint, op.outPoint, op.index, op.newClipId);
+      const pos = indexAtSource(state, op.atSource!.sourceId, op.atSource!.time);
+      if (!pos.ok) return pos;
+      return insertClip(pos.state, op.sourceId, op.inPoint, op.outPoint, pos.index, op.newClipId);
+    }
     case "keepRanges":
       return keepRanges(state, op.clipId, op.ranges);
     case "removeOverlay":

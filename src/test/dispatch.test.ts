@@ -570,7 +570,7 @@ describe("v4 migration", () => {
     writeFileSync(projectFilePath(), JSON.stringify(v3), "utf-8");
 
     const session = await loadProject(projectFilePath());
-    assert.equal(session.state.version, 5);
+    assert.equal(session.state.version, 6);
     assert.equal(clipsInOrder(session.state.timeline)[0]!.userLabel, undefined);
   });
 });

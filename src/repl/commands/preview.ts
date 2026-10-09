@@ -13,6 +13,7 @@ import {
 } from "../../engine/preview.js";
 import { parseTime } from "../../utils/time.js";
 import { overlayLayersFor } from "../../engine/layers.js";
+import { withProxies } from "../../engine/draft.js";
 import type { OverlayLayer } from "../../engine/types.js";
 
 /**
@@ -203,6 +204,9 @@ export async function previewStateScope(
   scope: PreviewScope,
   deps: PreviewDeps = {},
 ): Promise<PreviewOutcome> {
+  // Previews read each source's cached 720p master (same timestamps), not the
+  // 4K original — seconds instead of minutes. Export always reads originals.
+  state = await withProxies(state);
   const segs = segmentsForScope(state, scope);
   if (!segs.ok) return { ok: false, error: segs.error };
   // Overlays intersecting the rendered window, re-based to the file's t=0.

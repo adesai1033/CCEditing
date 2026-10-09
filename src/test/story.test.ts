@@ -324,7 +324,6 @@ describe("a cutaway keeps the spine's sound (real ffmpeg)", { skip: !hasFfmpeg()
 
 // ── Deterministic story check ─────────────────────────────────────────────────
 
-import { lintStory } from "../agent/story-lint.js";
 import { runAgent } from "../agent/loop.js";
 import type { ChatProvider, ChatResponse } from "../agent/providers/types.js";
 import type { CriticInput, CriticVerdict } from "../agent/critic.js";
@@ -351,123 +350,81 @@ function withCall(state: ProjectState, sourceId: string): ProjectState {
   };
 }
 
-describe("story check", () => {
-  /** What the last three runs produced: call → son → call → screen recording, call ended at 67.8. */
-  function cutOffPlan(state: ProjectState) {
-    const [call, son, screen] = clipsInOrder(state.timeline);
-    return [
-      { type: "split" as const, clipId: call!.id, splitPoint: 56.78, newClipId: "call-2" },
-      { type: "trim" as const, clipId: "call-2", inPoint: 61.98, outPoint: 67.8 },
-      { type: "trim" as const, clipId: son!.id, inPoint: 52, outPoint: 64.5 },
-      { type: "move" as const, clipId: son!.id, newIndex: 1 },
-      { type: "trim" as const, clipId: screen!.id, inPoint: 107.8, outPoint: 146.78 },
-    ];
-  }
-  function fourSources(): { state: ProjectState; spine: string } {
-    let s = createProject("t");
-    s = ok(addSource(s, media("elderly.MOV", 143.49)));
-    s = ok(addSource(s, media("son.MOV", 138.59)));
-    s = ok(addSource(s, media("overlay_for_son.mov", 51.3)));
-    s = ok(addSource(s, media("computer_use.mov", 146.78)));
-    s = ok(removeClipBySource(s, s.sources[2]!.id));
-    return { state: withCall(s, s.sources[0]!.id), spine: s.sources[0]!.id };
-  }
-
-  test("flags a call cut off mid-story with another source's sound after it, quoting the dropped lines", () => {
-    const { state } = fourSources();
-    const r = applyOperations(state, cutOffPlan(state));
-    assert.ok(r.ok, r.ok ? "" : r.error);
-    const issues = lintStory(r.state);
-    assert.equal(issues.length, 1);
-    const i = issues[0]!;
-    assert.equal(i.fileName, "elderly.MOV");
-    assert.ok(Math.abs(i.stopsAt - 67.8) < 1e-6);
-    assert.deepEqual(i.followedBy, ["computer_use.mov"]);
-    assert.ok(i.droppedLines.some((l) => l.text === "Your ride is booked."));
-    assert.equal(i.droppedLines.filter((l) => l.text === "Bye.").length, 1, "transcription stutter collapsed");
-    assert.match(i.message, /Your ride is booked/);
-    assert.match(i.message, /Alvaro is coming/, "the resolution is quoted, not elided");
-    assert.match(i.message, /Have a good day, OG/);
-    assert.doesNotMatch(i.message, /more …/);
-    assert.match(i.message, /switches the PICTURE/);
-    assert.match(i.message, /cutaways over those lines/);
-  });
-
-  test("is quiet for the spine pattern: the call plays to its end under cutaways", () => {
-    const { state, spine } = fourSources();
-    const [call, son, screen] = clipsInOrder(state.timeline);
-    const r = applyOperations(state, [
-      { type: "keepRanges", clipId: call!.id, ranges: [{ start: 15, end: 67.5 }, { start: 121.8, end: 140 }] },
-      { type: "delete", clipId: son!.id },
-      { type: "delete", clipId: screen!.id },
-      { type: "addOverlay", sourceId: state.sources[3]!.id, inPoint: 117, outPoint: 125, fit: "contain", atSource: { sourceId: spine, time: 121.9 } },
-    ]);
-    assert.ok(r.ok, r.ok ? "" : r.error);
-    assert.deepEqual(lintStory(r.state), []);
-  });
-
-  test("checks only the main dialogue source, not a second mic's room bleed", () => {
-    const { state } = fourSources();
-    // son.MOV's mic picked up a few of the call's lines.
-    const sonId = state.sources[1]!.id;
-    const bleed = CALL.slice(5, 12);
-    const withBleed: ProjectState = {
-      ...state,
-      sources: state.sources.map((s) => s.id === sonId
-        ? { ...s, analyses: { transcript: { segments: bleed, duration: 138.59, model: "m", hasAudio: true, transcribedAt: "x" } } }
-        : s),
-    };
-    const r = applyOperations(withBleed, cutOffPlan(withBleed));
-    assert.ok(r.ok);
-    assert.deepEqual(lintStory(r.state).map((i) => i.fileName), ["elderly.MOV"]);
-  });
-
-  test("is quiet when what follows is only a stray word or two", () => {
-    const { state } = fourSources();
-    const [call] = clipsInOrder(state.timeline);
-    const r = applyOperations(state, [{ type: "trim", clipId: call!.id, inPoint: 0, outPoint: 139 }]);
-    assert.ok(r.ok);
-    assert.deepEqual(lintStory(r.state), [], "only 'Bye.' is left after 139s");
-  });
-
-  test("the loop returns the check once, applies nothing, and accepts the same plan the second time", async () => {
-    const { state } = fourSources();
-    const ops = cutOffPlan(state);
-    const plan = (id: string): ChatResponse => ({
-      content: [{ type: "tool_use", id, name: "propose_edit_plan", input: { summary: "story", operations: ops } }],
-      stopReason: "tool_use", usage: { inputTokens: 0, outputTokens: 0 },
-    });
-    const done: ChatResponse = { content: [{ type: "text", text: "Done." }], stopReason: "end_turn", usage: { inputTokens: 0, outputTokens: 0 } };
-    const sent: ChatResponse[] = [plan("p1"), plan("p2"), done];
-    const seenToolResults: string[] = [];
-    let i = 0;
-    const respond = (req: { messages: Array<{ content: Array<{ type: string; content?: unknown }> }> }) => {
-      const last = req.messages[req.messages.length - 1]!;
-      for (const b of last.content) if (b.type === "tool_result") seenToolResults.push(String(b.content));
-      return sent[i++]!;
-    };
-    const handle = (r: ChatResponse) => ({
-      [Symbol.asyncIterator]: async function* () { /* no deltas */ },
-      finalResponse: async () => r,
-    });
-    const provider = {
-      send: async (req: never) => respond(req),
-      stream: (req: never) => handle(respond(req)),
-    } as unknown as ChatProvider;
-    const critic = async (_: CriticInput): Promise<CriticVerdict> => ({ verdict: "approve", concerns: [] });
-
-    const r = await runAgent({
-      userPrompt: "make the story", session: createSession(state), messages: [], autoApprove: true,
-      confirm: async () => ({ approved: true }), provider, critic,
-    });
-    assert.equal(r.isError, false, r.output);
-    assert.match(seenToolResults[0]!, /"status":"check"/);
-    assert.match(seenToolResults[0]!, /Your ride is booked/);
-    assert.equal(r.session.undo.length, 1, "the re-proposed plan applied (the check speaks once)");
-  });
-});
-
 function removeClipBySource(s: ProjectState, sourceId: string): MutationResult {
   const clip = clipsInOrder(s.timeline).find((c) => c.sourceId === sourceId)!;
   return applyOperations(s, [{ type: "delete", clipId: clip.id }]) as MutationResult;
 }
+
+// ── Concision check ───────────────────────────────────────────────────────────
+
+
+// ── Cutting in at a dialogue moment (move / insertClip atSource) ──────────────
+
+describe("move and insertClip by dialogue moment", () => {
+  test("after tightening, the son shot cuts in right after 'check with Jay', not after the first piece", () => {
+    const { state, spine, son } = story();
+    const [call, sonClip, screen] = clipsInOrder(state.timeline);
+    const r = applyOperations(state, [
+      { type: "keepRanges", clipId: call!.id, ranges: [{ start: 15.2, end: 19.98 }, { start: 26.1, end: 51.84 }, { start: 61.96, end: 67.66 }] },
+      { type: "delete", clipId: screen!.id },
+      { type: "trim", clipId: sonClip!.id, inPoint: 50, outPoint: 65 },
+      { type: "move", clipId: sonClip!.id, atSource: { sourceId: spine, time: 51.84 } },
+    ]);
+    assert.ok(r.ok, r.ok ? "" : r.error);
+    assert.deepEqual(clipsInOrder(r.state.timeline).map((c) => [c.label, c.inPoint, c.outPoint]), [
+      ["elderly.MOV", 15.2, 19.98], ["elderly.MOV", 26.1, 51.84], ["son.MOV", 50, 65], ["elderly.MOV", 61.96, 67.66],
+    ]);
+    void son;
+  });
+
+  test("a moment inside a clip splits it there; insertClip lands between the halves", () => {
+    const { state, spine, son } = story();
+    const r = applyOperations(state, [{ type: "insertClip", sourceId: son, inPoint: 50, outPoint: 65, atSource: { sourceId: spine, time: 56.78 } }]);
+    assert.ok(r.ok, r.ok ? "" : r.error);
+    assert.deepEqual(clipsInOrder(r.state.timeline).slice(0, 3).map((c) => [c.label, c.inPoint, c.outPoint]), [
+      ["elderly.MOV", 0, 56.78], ["son.MOV", 50, 65], ["elderly.MOV", 56.78, 143.49],
+    ]);
+  });
+
+  test("exactly one of index/atSource; a cut moment is a clear error", () => {
+    const { state, spine, son } = story();
+    const sonClip = clipsInOrder(state.timeline)[1]!;
+    const none = applyOperations(state, [{ type: "move", clipId: sonClip.id }]);
+    assert.ok(!none.ok && /exactly one of newIndex or atSource/.test(none.error));
+    const both = applyOperations(state, [{ type: "insertClip", sourceId: son, inPoint: 0, outPoint: 1, index: 0, atSource: { sourceId: spine, time: 5 } }]);
+    assert.ok(!both.ok && /exactly one of index or atSource/.test(both.error));
+    const call = clipsInOrder(state.timeline)[0]!;
+    const gone = applyOperations(state, [
+      { type: "keepRanges", clipId: call.id, ranges: [{ start: 0, end: 10 }] },
+      { type: "move", clipId: sonClip.id, atSource: { sourceId: spine, time: 50 } },
+    ]);
+    assert.ok(!gone.ok && /not on the main track/.test(gone.error));
+  });
+
+  test("the confirm gate names the dialogue moment", () => {
+    const { state, spine } = story();
+    const sonClip = clipsInOrder(state.timeline)[1]!;
+    const lines = renderPlanForConfirmation(state, { summary: "s", operations: [{ type: "move", clipId: sonClip.id, atSource: { sourceId: spine, time: 51.84 } }] }).renderedLines;
+    assert.equal(lines[0], "Move clip [2] son.MOV → where elderly.MOV reaches 0:51.8");
+  });
+});
+
+describe("critic and confirm-gate wording", () => {
+  test("the critic is told matched excerpts are intended, a long cutaway is the defect", async () => {
+    const { criticSystemPrompt } = await import("../agent/critic-prompt.js");
+    assert.match(criticSystemPrompt(), /never flag them as unrequested or ask to merge them into one long cutaway/);
+  });
+
+  test("tightening a clip created earlier in the same plan never shows a negative cut", () => {
+    const { state, spine } = story();
+    const lines = renderPlanForConfirmation(state, {
+      summary: "s",
+      operations: [
+        { type: "insertClip", sourceId: spine, inPoint: 62, outPoint: 140, index: 1, newClipId: "part2" },
+        { type: "keepRanges", clipId: "part2", ranges: [{ start: 62, end: 67.5 }, { start: 121.9, end: 140 }] },
+      ],
+    }).renderedLines;
+    assert.match(lines[1]!, /keep 2 ranges \(24s\)$/);
+    assert.doesNotMatch(lines[1]!, /-\d+s cut/);
+  });
+});

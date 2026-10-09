@@ -267,7 +267,7 @@ describe("overlay persistence", () => {
     await saveProject(createSession(state), file);
     const loaded = await loadProject(file);
     assert.deepEqual(overlaysOf(loaded.state.timeline), overlaysOf(state.timeline));
-    assert.equal(loaded.state.version, 5);
+    assert.equal(loaded.state.version, 6);
   });
 
   test("a pre-v5 project loads with an empty overlay track", async () => {
@@ -334,8 +334,8 @@ describe("buildOverlayArgs", () => {
 
     const filter = args[args.indexOf("-filter_complex") + 1]!;
     assert.match(filter, /\[1:v\]scale=480:270,setpts=PTS-STARTPTS\+2\/TB\[ov0\]/);
-    assert.match(filter, /\[0:v\]\[ov0\]overlay=x=1382:y=32:eof_action=pass:enable=between\(t\\,2\\,5\)\[v0\]/);
-    assert.match(filter, /\[v0\]\[ov1\]overlay=x=58:y=778:eof_action=pass:enable=between\(t\\,0\\,10\),format=yuv420p\[vout\]/);
+    assert.match(filter, /\[0:v\]\[ov0\]overlay=x=1382:y=32:eof_action=pass:enable=between\(t\\,2\\,5\)\[vo0\]/);
+    assert.match(filter, /\[vo0\]\[ov1\]overlay=x=58:y=778:eof_action=pass:enable=between\(t\\,0\\,10\),format=yuv420p\[vout\]/);
 
     const mapIdx = args.indexOf("-map");
     assert.deepEqual(args.slice(mapIdx, mapIdx + 4), ["-map", "[vout]", "-map", "0:a?"]);

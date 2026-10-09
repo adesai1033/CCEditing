@@ -152,7 +152,17 @@ describe("runCritic — isolation", () => {
   test("review runs with reasoning enabled (decision 7)", async () => {
     const { provider, requests } = cannedProvider([reviewToolUse({ verdict: "approve", concerns: [] })]);
     await runCritic(makeInput(makeState()), { provider });
-    assert.deepEqual(requests[0]!.reasoning, { enabled: true });
+    assert.deepEqual(requests[0]!.reasoning, { enabled: true, effort: "medium" });
+  });
+
+  test("a revise with only minor concerns counts as approve, concerns kept", async () => {
+    const { provider } = cannedProvider([reviewToolUse({
+      verdict: "revise",
+      concerns: [{ severity: "minor", issue: "overlay ends a second early" }],
+    })]);
+    const v = await runCritic(makeInput(makeState()), { provider });
+    assert.equal(v.verdict, "approve");
+    assert.equal(v.concerns.length, 1);
   });
 
   test("a missing content map is stated, not fabricated", async () => {

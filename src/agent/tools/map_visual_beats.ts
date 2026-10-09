@@ -1,6 +1,7 @@
 import type { ProjectState, SourceFile, VisualBeat } from "../../project/types.js";
 import type { Tool, ToolSchema, ToolResult } from "../types.js";
 import { mapVisualBeats, DESCRIBE_MODEL } from "../backends/gemini.js";
+import { memoized } from "../prefetch.js";
 
 /**
  * `map_visual_beats` — a time-coded map of what is VISIBLE across a whole
@@ -33,7 +34,11 @@ export interface BeatsBackend {
   mapVisualBeats: (filePath: string, durationSec: number) => Promise<VisualBeat[]>;
 }
 
-const realBeatsBackend: BeatsBackend = { mapVisualBeats };
+/** Memoized per file, so a beat map started in the background at /open
+ *  (agent/prefetch.ts) is reused rather than redone. */
+export const realBeatsBackend: BeatsBackend = {
+  mapVisualBeats: (filePath, durationSec) => memoized("beats", filePath, () => mapVisualBeats(filePath, durationSec)),
+};
 
 export async function executeMapVisualBeats(
   state: ProjectState,

@@ -1194,10 +1194,10 @@ describe("runAgent — critic (3G)", () => {
 
   test("revision rounds respect the per-turn tool budget: with no budget left, present instead of revising", async () => {
     const { session, clipId } = makeSession();
-    // Burn the budget down to 1 with 24 query_timeline calls, then propose:
+    // Burn the budget down to 1 with 39 query_timeline calls (budget 40), then propose:
     // the plan call takes the last budget unit, so a revise verdict cannot be
     // sent back for a re-proposal — the plan is presented with concerns.
-    const burn: ChatResponse[] = Array.from({ length: 24 }, (_, i) =>
+    const burn: ChatResponse[] = Array.from({ length: 39 }, (_, i) =>
       toolUse("query_timeline", {}, `tu_q${i}`),
     );
     const provider = mockProvider([
@@ -1292,5 +1292,67 @@ describe("runAgent — the critic sees the director's perception evidence", () =
     assert.deepEqual(evidence[0]!.input, { query: "new place check" });
     const lines = (evidence[0]!.result as { lines: string[] }).lines;
     assert.ok(lines.includes("49.98–51.84 I'd like to check with Jay before booking the ride."), "exact transcript times reach the critic");
+  });
+});
+
+// ── Concurrent reads in one turn ──────────────────────────────────────────────
+
+import { buildDefaultRegistry as buildRegistryForConcurrency } from "../agent/registry.js";
+
+describe("runAgent — reads in one turn run concurrently", () => {
+  test("both start before either ends; both cache writes and both results survive, in request order", async () => {
+    const { session } = makeSession();
+    const sourceId = session.state.sources[0]!.id;
+    const registry = buildRegistryForConcurrency();
+    const log: string[] = [];
+    const slow = (name: string, key: "scenes" | "description") => ({
+      schema: { name, description: name, input_schema: { type: "object" as const, properties: {} } },
+      execute: async (st: ProjectState) => {
+        log.push(`start ${name}`);
+        await new Promise((r) => setTimeout(r, 25));
+        log.push(`end ${name}`);
+        const value = key === "scenes" ? { threshold: 0.4, boundaries: [1], detectedAt: "x" } : { text: "d", model: "m", generatedAt: "x" };
+        return {
+          ok: true as const,
+          result: { from: name },
+          stateUpdate: { ...st, sources: st.sources.map((x) => (x.id === sourceId ? { ...x, analyses: { ...x.analyses, [key]: value } } : x)) },
+        };
+      },
+    });
+    registry.register(slow("detect_scenes", "scenes"));
+    registry.register(slow("describe_clip", "description"));
+
+    const twoReads: ChatResponse = {
+      content: [
+        { type: "tool_use", id: "a", name: "detect_scenes", input: { sourceId } },
+        { type: "tool_use", id: "b", name: "describe_clip", input: { sourceId } },
+      ],
+      stopReason: "tool_use",
+      usage: { inputTokens: 0, outputTokens: 0 },
+    };
+    const r = await runAgent({
+      userPrompt: "look", session, messages: [], autoApprove: true,
+      confirm: async () => ({ approved: true }), provider: mockProvider([twoReads, endTurn("ok")]), registry,
+    });
+    assert.equal(r.isError, false, r.output);
+    assert.deepEqual(log.slice(0, 2).sort(), ["start describe_clip", "start detect_scenes"], "both started before either ended");
+    const a = r.session.state.sources[0]!.analyses;
+    assert.ok(a.scenes && a.description, "both cache writes kept");
+    const results = r.messages.find((m) => m.role === "user" && m.content.some((b) => b.type === "tool_result"))!;
+    assert.deepEqual(results.content.map((b) => (b.type === "tool_result" ? b.toolUseId : "")), ["a", "b"]);
+  });
+});
+
+describe("runAgent — tool budget warning", () => {
+  test("with 5 calls left the agent is told to propose now, once per read round", async () => {
+    const { session } = makeSession();
+    const reads: ChatResponse[] = Array.from({ length: 35 }, (_, i) => toolUse("query_timeline", {}, `q${i}`));
+    const { provider, requests } = capturingProvider([...reads, endTurn("ok")]);
+    await runAgent({ userPrompt: "look", session, messages: [], autoApprove: true, confirm: async () => ({ approved: true }), provider });
+    const lastUser = (i: number) => requests[i]!.messages[requests[i]!.messages.length - 1]!;
+    const hasNudge = (i: number) => lastUser(i).content.some((b) => b.type === "text" && /tool calls? left this turn/.test(b.text));
+    assert.equal(hasNudge(34), false, "30 left: no warning");
+    assert.equal(hasNudge(35), true, "5 left: warned");
+    assert.match((lastUser(35).content.find((b) => b.type === "text") as { text: string }).text, /Only 5 tool calls left/);
   });
 });

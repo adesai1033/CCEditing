@@ -243,8 +243,8 @@ describe("preview encoder args", () => {
   const seg: PreviewSegment = { input: "/x/a.mp4", start: 4, end: 34 };
   const args = buildPreviewTrimArgs(seg, "/tmp/out.mp4");
 
-  test("keeps frame-accurate output seeking: -ss AFTER -i, with the exact range", () => {
-    assert.ok(args.indexOf("-i") < args.indexOf("-ss"), "-ss must follow -i (output seeking)");
+  test("seeks on the input (frame-accurate when re-encoding, and far faster), with the exact range", () => {
+    assert.ok(args.indexOf("-ss") < args.indexOf("-i"), "-ss precedes -i (input seeking)");
     assert.equal(args[args.indexOf("-ss") + 1], "4");
     assert.equal(args[args.indexOf("-t") + 1], "30");
   });
@@ -262,7 +262,8 @@ describe("preview encoder args", () => {
     assert.equal(exp[exp.indexOf("-crf") + 1], String(EXPORT_ENCODE.crf));
     assert.equal(exp[exp.indexOf("-preset") + 1], EXPORT_ENCODE.preset);
     assert.ok(!exp.includes("-vf"), "export never downscales");
-    assert.ok(exp.indexOf("-i") < exp.indexOf("-ss"));
+    assert.ok(exp.indexOf("-ss") < exp.indexOf("-i"));
+    assert.equal(exp[exp.indexOf("-b:a") + 1], "256k", "export audio keeps a source-grade bitrate");
   });
 });
 

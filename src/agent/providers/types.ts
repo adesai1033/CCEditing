@@ -90,6 +90,9 @@ export interface ChatRequest {
   /** Which agent context issued this request (3K). Display/accounting metadata
    *  only — providers ignore it; the usage tap uses it for /cost attribution. */
   role?: "director" | "scout" | "critic";
+  /** Model override for this request (per-role selection; see default.ts).
+   *  Providers fall back to their own default when absent. */
+  model?: string;
 }
 
 /**

@@ -12,7 +12,9 @@ import { createSession } from "./session.js";
 //
 // v5: the timeline gained an optional `overlays` track (picture-in-picture
 // layers). Additive — pre-v5 projects load with no overlays.
-const SUPPORTED_VERSION = 5;
+// v6: optional project-level `sync` (measured offsets between sources
+// recorded at the same time). Additive; older projects load without it.
+const SUPPORTED_VERSION = 6;
 
 // ── Create ────────────────────────────────────────────────────────────────────
 
@@ -75,7 +77,7 @@ export async function loadProject(filePath: string): Promise<ProjectSession> {
   }
 
   const version = file["version"] as number;
-  if (![1, 2, 3, 4, 5].includes(version)) {
+  if (![1, 2, 3, 4, 5, 6].includes(version)) {
     throw new Error(`Unsupported project version ${version} (expected ${SUPPORTED_VERSION})`);
   }
 
@@ -127,6 +129,7 @@ function extractState(file: Record<string, unknown>): ProjectState {
     updatedAt: file["updatedAt"] as string,
     sources: ensureAnalyses(file["sources"] as SourceFile[]),
     timeline: ensureOverlays(file["timeline"] as Timeline),
+    ...(file["sync"] && typeof file["sync"] === "object" ? { sync: file["sync"] as ProjectState["sync"] } : {}),
   };
 }
 

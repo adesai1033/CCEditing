@@ -14,6 +14,8 @@ export type CostRole = "director" | "scout" | "critic";
 
 export interface UsageTotals {
   calls: number;
+  /** Summed wall time of this role's calls, ms. */
+  durationMs: number;
   inputTokens: number;
   outputTokens: number;
   reasoningTokens: number;
@@ -26,7 +28,7 @@ export type CostTotals = Record<CostRole, UsageTotals>;
 const ROLES: CostRole[] = ["director", "scout", "critic"];
 
 function emptyUsage(): UsageTotals {
-  return { calls: 0, inputTokens: 0, outputTokens: 0, reasoningTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
+  return { calls: 0, durationMs: 0, inputTokens: 0, outputTokens: 0, reasoningTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
 }
 
 export function emptyTotals(): CostTotals {
@@ -34,12 +36,13 @@ export function emptyTotals(): CostTotals {
 }
 
 /** Pure accumulation of one response's usage into the totals. */
-export function addUsage(totals: CostTotals, role: CostRole, usage: ChatResponse["usage"]): CostTotals {
+export function addUsage(totals: CostTotals, role: CostRole, usage: ChatResponse["usage"], durationMs = 0): CostTotals {
   const prev = totals[role];
   return {
     ...totals,
     [role]: {
       calls: prev.calls + 1,
+      durationMs: prev.durationMs + durationMs,
       inputTokens: prev.inputTokens + (usage.inputTokens ?? 0),
       outputTokens: prev.outputTokens + (usage.outputTokens ?? 0),
       reasoningTokens: prev.reasoningTokens + (usage.reasoningTokens ?? 0),
@@ -55,8 +58,32 @@ export function addUsage(totals: CostTotals, role: CostRole, usage: ChatResponse
 
 let sessionTotals: CostTotals = emptyTotals();
 
-export function recordUsage(role: CostRole, usage: ChatResponse["usage"]): void {
-  sessionTotals = addUsage(sessionTotals, role, usage);
+/** One completed model call, for the per-call breakdown in /cost. */
+export interface CallRecord {
+  role: CostRole;
+  model: string;
+  durationMs: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  inputTokens: number;
+}
+
+/** Recent calls, newest last; bounded so a long session can't grow it forever. */
+export const MAX_CALL_RECORDS = 50;
+let callLog: CallRecord[] = [];
+
+export function recordUsage(role: CostRole, usage: ChatResponse["usage"], meta?: { durationMs: number; model: string }): void {
+  sessionTotals = addUsage(sessionTotals, role, usage, meta?.durationMs ?? 0);
+  if (meta) {
+    callLog = [...callLog, {
+      role, model: meta.model, durationMs: meta.durationMs,
+      outputTokens: usage.outputTokens ?? 0, reasoningTokens: usage.reasoningTokens ?? 0, inputTokens: usage.inputTokens ?? 0,
+    }].slice(-MAX_CALL_RECORDS);
+  }
+}
+
+export function getCallLog(): CallRecord[] {
+  return callLog;
 }
 
 export function getSessionTotals(): CostTotals {
@@ -66,6 +93,7 @@ export function getSessionTotals(): CostTotals {
 /** Test hook — the store is process-global. */
 export function resetSessionTotals(): void {
   sessionTotals = emptyTotals();
+  callLog = [];
 }
 
 // ── Report ────────────────────────────────────────────────────────────────────
@@ -74,19 +102,21 @@ function fmt(n: number): string {
   return n.toLocaleString("en-US");
 }
 
-export function renderCostReport(totals: CostTotals): string {
-  const header = ["role", "calls", "input", "output", "reasoning", "cache read", "cache write"];
+const secs = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
+
+export function renderCostReport(totals: CostTotals, calls: CallRecord[] = []): string {
+  const header = ["role", "calls", "time", "input", "output", "reasoning", "cache read", "cache write"];
   const rows = ROLES.map((role) => {
     const u = totals[role];
-    return [role, fmt(u.calls), fmt(u.inputTokens), fmt(u.outputTokens), fmt(u.reasoningTokens), fmt(u.cacheReadTokens), fmt(u.cacheCreationTokens)];
+    return [role, fmt(u.calls), secs(u.durationMs), fmt(u.inputTokens), fmt(u.outputTokens), fmt(u.reasoningTokens), fmt(u.cacheReadTokens), fmt(u.cacheCreationTokens)];
   });
   const sum = ROLES.reduce((acc, r) => {
     const u = totals[r];
-    acc.calls += u.calls; acc.inputTokens += u.inputTokens; acc.outputTokens += u.outputTokens;
+    acc.calls += u.calls; acc.durationMs += u.durationMs; acc.inputTokens += u.inputTokens; acc.outputTokens += u.outputTokens;
     acc.reasoningTokens += u.reasoningTokens; acc.cacheReadTokens += u.cacheReadTokens; acc.cacheCreationTokens += u.cacheCreationTokens;
     return acc;
   }, emptyUsage());
-  rows.push(["total", fmt(sum.calls), fmt(sum.inputTokens), fmt(sum.outputTokens), fmt(sum.reasoningTokens), fmt(sum.cacheReadTokens), fmt(sum.cacheCreationTokens)]);
+  rows.push(["total", fmt(sum.calls), secs(sum.durationMs), fmt(sum.inputTokens), fmt(sum.outputTokens), fmt(sum.reasoningTokens), fmt(sum.cacheReadTokens), fmt(sum.cacheCreationTokens)]);
 
   const widths = header.map((h, c) => Math.max(h.length, ...rows.map((r) => r[c]!.length)));
   const pad = (cells: string[]) =>
@@ -101,6 +131,12 @@ export function renderCostReport(totals: CostTotals): string {
     const line = "  " + pad(row);
     lines.push(row[0] === "total" ? paint.emphasis(line) : line);
   }
-  lines.push(paint.muted("  Tokens only — no dollar estimate; pricing drifts. Reasoning counts toward output."));
+  lines.push(paint.muted("  Tokens only — no dollar estimate; pricing drifts. Reasoning counts toward output. Time is wall time per call."));
+  if (calls.length > 0) {
+    lines.push("", paint.heading(`Recent calls (last ${calls.length})`));
+    for (const c of calls.slice(-12)) {
+      lines.push(paint.muted(`  ${c.role.padEnd(8)} ${secs(c.durationMs).padStart(7)}  out ${fmt(c.outputTokens).padStart(6)}  reasoning ${fmt(c.reasoningTokens).padStart(6)}  ${c.model}`));
+    }
+  }
   return lines.join("\n");
 }

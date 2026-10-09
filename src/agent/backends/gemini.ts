@@ -357,5 +357,81 @@ export function normalizeBeats(raw: unknown, durationSec: number): VisualBeat[] 
     .map((b) => ({ start: r3(b.start), end: r3(b.end), description: b.description }));
 }
 
+// ── Watching a cut ────────────────────────────────────────────────────────────
+
+export interface CutNote {
+  /** Where in the cut (seconds). */
+  time: number;
+  severity: "major" | "minor";
+  issue: string;
+}
+
+export interface CutReview {
+  verdict: "approve" | "revise";
+  notes: CutNote[];
+}
+
+/**
+ * Watch a rendered cut, as an editor reviewing a rough cut would, and return
+ * timestamped notes. `brief` carries the request and the intended shot list;
+ * judgment is the model's — no criteria are scored here.
+ */
+export async function reviewCut(filePath: string, brief: string): Promise<CutReview> {
+  const g = ai();
+  const active = await uploadAndWait(g, filePath, "draft cut");
+  const response = await hedged((signal) => g.models.generateContent({
+    model: DESCRIBE_MODEL,
+    contents: [{ role: "user", parts: [
+      { fileData: { mimeType: active.mimeType!, fileUri: active.uri! } },
+      { text: brief },
+    ] }],
+    config: {
+      abortSignal: signal,
+      responseMimeType: "application/json",
+      responseJsonSchema: {
+        type: "object",
+        properties: {
+          verdict: { type: "string", enum: ["approve", "revise"] },
+          notes: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                time: { type: "number" },
+                severity: { type: "string", enum: ["major", "minor"] },
+                issue: { type: "string" },
+              },
+              required: ["time", "severity", "issue"],
+            },
+          },
+        },
+        required: ["verdict", "notes"],
+      },
+    },
+  }), {
+    deadlineMs: GENERATE_TIMEOUT_MS,
+    timeoutMessage: `Gemini took longer than ${GENERATE_TIMEOUT_MS / 1000}s to review the draft (${MAX_ATTEMPTS} parallel attempts)`,
+  });
+  return parseCutReview(response.text ?? "");
+}
+
+/** Parse and sanity-check a review; anything malformed degrades to no notes. */
+export function parseCutReview(text: string): CutReview {
+  let raw: unknown;
+  try { raw = JSON.parse(text); } catch { return { verdict: "approve", notes: [] }; }
+  const r = raw as { verdict?: unknown; notes?: unknown };
+  const notes: CutNote[] = Array.isArray(r.notes)
+    ? r.notes
+        .filter((n): n is CutNote =>
+          typeof n === "object" && n !== null &&
+          typeof (n as CutNote).time === "number" && typeof (n as CutNote).issue === "string" &&
+          ((n as CutNote).severity === "major" || (n as CutNote).severity === "minor"))
+        .map((n) => ({ time: Math.max(0, n.time), severity: n.severity, issue: n.issue.trim() }))
+        .sort((a, b) => a.time - b.time)
+    : [];
+  const verdict = r.verdict === "revise" && notes.some((n) => n.severity === "major") ? "revise" : "approve";
+  return { verdict, notes };
+}
+
 export const realBackend = { describeVideo, describeVideoSegment };
 export type GeminiBackend = typeof realBackend;

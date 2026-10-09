@@ -522,6 +522,40 @@ export function timelineTimeOf(
 }
 
 /**
+ * The main-track index at which a moment of a source plays — where to put a
+ * clip so it cuts in exactly when `sourceId` reaches `time`. If that moment
+ * falls inside a clip, the clip is split there first (so the cut lands on the
+ * line, not at a clip boundary). `exclude` leaves one clip out of the search
+ * (the clip being moved). Resolved against the state as it stands, i.e. after
+ * a plan's earlier operations — the reason it survives keepRanges where a
+ * hand-computed index did not.
+ */
+export function indexAtSource(
+  state: ProjectState,
+  sourceId: string,
+  time: number,
+  exclude?: string,
+): { ok: true; state: ProjectState; index: number } | { ok: false; error: string } {
+  const source = findSource(state, sourceId);
+  if (!source) return { ok: false, error: `Source not found: ${sourceId}` };
+  const ordered = clipsInOrder(state.timeline).filter((c) => c.id !== exclude);
+  const EPS = 0.05;
+  for (let i = 0; i < ordered.length; i++) {
+    const c = ordered[i]!;
+    if (c.sourceId !== sourceId || time < c.inPoint - EPS || time > c.outPoint + EPS) continue;
+    if (time <= c.inPoint + EPS) return { ok: true, state, index: i };
+    if (time >= c.outPoint - EPS) return { ok: true, state, index: i + 1 };
+    const split = splitClip(state, c.id, time);
+    if (!split.ok) return split;
+    return { ok: true, state: split.state, index: i + 1 };
+  }
+  return {
+    ok: false,
+    error: `${source.fileName} at ${time}s is not on the main track (it was cut or never placed) — anchor to a moment that plays`,
+  };
+}
+
+/**
  * Put a range of any source on the main track at a 0-based index (the
  * agent's way to use a source more than once, or to bring one back after it
  * was deleted). `newClipId` names it for later operations in the same plan.

@@ -1,6 +1,12 @@
 import type { ProjectSession, Operation } from "../project/session.js";
 import { applyPlan, applyOperations } from "../project/session.js";
-import { lintStory } from "./story-lint.js";
+import { mergeAnalyses } from "./scout.js";
+import { ProposeProgramInputSchema } from "./propose_program.js";
+import { compileProgram, shotList, renderShotList, type Program } from "../edit/program.js";
+import { measureProjectSync, syncIsCurrent } from "./tools/sync_sources.js";
+import { defaultReviewer, type ReviewerFn } from "./reviewer.js";
+import { executeDetectSilence } from "./tools/detect_silence.js";
+import { CUT_SILENCE } from "../edit/cut-facts.js";
 import { staticSystemPrefix, stateSnapshotSegment } from "./prompt.js";
 import { buildDefaultRegistry, type ToolRegistry } from "./registry.js";
 import { buildDefaultProvider } from "./providers/default.js";
@@ -20,7 +26,12 @@ import { runCritic, type CriticConcern, type CriticInput, type CriticVerdict } f
 import { evidenceFrom, type EvidenceItem } from "./evidence.js";
 import type { ContentMap } from "./content-map.js";
 
-const MAX_TOOL_CALLS_PER_TURN = 25;
+// Reads now run in parallel and the cut is verified line by line, so a story
+// edit legitimately uses more calls: a measured run spent all 25 on checks and
+// ended with nothing applied. 40, plus a warning when the end is near.
+const MAX_TOOL_CALLS_PER_TURN = 40;
+/** When this many calls remain, the director is told to propose now. */
+const BUDGET_WARNING_AT = 5;
 // ── Critic thresholds (3G) ────────────────────────────────────────────────────
 // Only compound plans get a critic pass: a plan with at least this many ops is
 // always reviewed, and a smaller multi-op plan is reviewed when it followed a
@@ -84,6 +95,9 @@ export interface AgentInput {
   criticEnabled?: boolean;
   // Injected for tests. Defaults to runCritic through this turn's provider.
   critic?: (input: CriticInput) => Promise<CriticVerdict>;
+  /** Injected for tests — watches a draft of a proposed program. Defaults to
+   *  the video reviewer (renders from proxies, reviewed by a video model). */
+  reviewer?: ReviewerFn;
 }
 
 export interface AgentResult {
@@ -109,7 +123,7 @@ interface AgentState {
   surveyed: boolean;             // 3G: survey_sources ran this turn (critic threshold input)
   lastContentMap: ContentMap | null; // 3G: the most recent survey's map, handed to the critic
   evidence: EvidenceItem[];      // perception results this turn, handed to the critic
-  storyChecked: boolean;         // the deterministic story check already spoke this turn
+
   criticRevisions: number;       // 3G: revision rounds consumed (capped at MAX_CRITIC_REVISIONS)
 }
 
@@ -123,6 +137,7 @@ export async function runAgent(input: AgentInput): Promise<AgentResult> {
   // The critic goes through the same ChatProvider seam as the director
   // (decision 7); it just builds its own fresh message list inside runCritic.
   const critic: CriticFn = input.critic ?? ((ci) => runCritic(ci, { provider }));
+  const reviewer: ReviewerFn = input.reviewer ?? defaultReviewer;
 
   let state: AgentState = {
     messages: [
@@ -139,7 +154,7 @@ export async function runAgent(input: AgentInput): Promise<AgentResult> {
     surveyed: false,
     lastContentMap: null,
     evidence: [],
-    storyChecked: false,
+
     criticRevisions: 0,
   };
 
@@ -245,7 +260,13 @@ export async function runAgent(input: AgentInput): Promise<AgentResult> {
     const toolResults: ToolResultBlock[] = [];
     let stopAfterThisRound = false;
 
-    for (const tu of toolUses) {
+    // Consecutive reads in one turn run CONCURRENTLY (a transcript, a beat
+    // map and a description don't wait on each other); propose_edit_plan
+    // stays serial and sees everything read before it. Results, cache writes
+    // and evidence are folded back in the order the director asked for them.
+    let i = 0;
+    while (i < toolUses.length) {
+      const tu = toolUses[i]!;
       if (state.toolBudget <= 0) {
         toolResults.push({
           type: "tool_result",
@@ -254,21 +275,56 @@ export async function runAgent(input: AgentInput): Promise<AgentResult> {
           isError: true,
         });
         stopAfterThisRound = true;
+        i++;
         continue;
       }
-      state.toolBudget -= 1;
 
-      const handled = await dispatchToolUse(tu, state, registry, input, critic);
-      state = handled.state;
-      toolResults.push(handled.result);
-      if (handled.stopAfterThisRound) stopAfterThisRound = true;
+      if (TERMINAL_TOOLS.has(tu.name)) {
+        state.toolBudget -= 1;
+        const handled = await dispatchToolUse(tu, state, registry, input, critic, reviewer);
+        state = handled.state;
+        toolResults.push(handled.result);
+        if (handled.stopAfterThisRound) stopAfterThisRound = true;
+        i++;
+        continue;
+      }
+
+      const batch: ToolUseBlock[] = [];
+      while (i < toolUses.length && !TERMINAL_TOOLS.has(toolUses[i]!.name) && state.toolBudget > 0) {
+        state.toolBudget -= 1;
+        batch.push(toolUses[i]!);
+        i++;
+      }
+      const base = state;
+      const handled = await Promise.all(batch.map((b) => dispatchToolUse(b, base, registry, input, critic, reviewer)));
+      for (const h of handled) {
+        state = {
+          ...state,
+          session: { ...state.session, state: mergeAnalyses(state.session.state, base.session.state, h.state.session.state) },
+          surveyed: state.surveyed || h.state.surveyed,
+          lastContentMap: h.state.lastContentMap !== base.lastContentMap ? h.state.lastContentMap : state.lastContentMap,
+          evidence: [...state.evidence, ...h.state.evidence.slice(base.evidence.length)],
+        };
+        toolResults.push(h.result);
+        if (h.stopAfterThisRound) stopAfterThisRound = true;
+      }
     }
 
+    // Running out of budget discards the whole turn, so say so while there is
+    // still room to propose. Only reads count down here; a plan already
+    // proposed this round doesn't need the nudge.
+    const nudge: ContentBlock[] = state.toolBudget > 0 && state.toolBudget <= BUDGET_WARNING_AT && !toolUses.some((t) => TERMINAL_TOOLS.has(t.name))
+      ? [{
+          type: "text",
+          text: `Only ${state.toolBudget} tool call${state.toolBudget === 1 ? "" : "s"} left this turn. Stop verifying and call ` +
+            "propose_edit_plan / propose_program now with what you have — running out applies nothing.",
+        }]
+      : [];
     state = {
       ...state,
       messages: [
         ...state.messages,
-        { role: "user", content: toolResults },
+        { role: "user", content: [...toolResults, ...nudge] },
       ],
     };
 
@@ -288,18 +344,25 @@ interface ToolHandled {
   stopAfterThisRound: boolean;
 }
 
+/** Tools that end in a confirm/apply — never batched with reads. */
+const TERMINAL_TOOLS = new Set(["propose_edit_plan", "propose_program"]);
+
 async function dispatchToolUse(
   tu: ToolUseBlock,
   state: AgentState,
   registry: ToolRegistry,
   input: AgentInput,
   critic: CriticFn,
+  reviewer: ReviewerFn,
 ): Promise<ToolHandled> {
   const start = Date.now();
   input.onProgress?.({ type: "tool_call", name: tu.name, input: tu.input });
 
   if (tu.name === "propose_edit_plan") {
     return handleProposePlan(tu, state, input, critic, start);
+  }
+  if (tu.name === "propose_program") {
+    return handleProposeProgram(tu, state, input, reviewer, start);
   }
 
   const entry = registry.get(tu.name);
@@ -419,34 +482,6 @@ async function handleProposePlan(
     }
   }
 
-  // ── Deterministic story check (before the critic and the user) ────────────
-  // Catches a dialogue source cut off mid-conversation with another source's
-  // sound playing after it (story-lint.ts). Speaks once per turn: re-proposing
-  // the same plan after reading it is the director's way of saying "intended".
-  if (!state.storyChecked) {
-    const scratch = applyOperations(state.session.state, parsed.data.operations as Operation[]);
-    const issues = scratch.ok ? lintStory(scratch.state) : [];
-    if (issues.length > 0) {
-      const detail = { status: "check", issues: issues.map((i) => i.message) };
-      input.onProgress?.({ type: "tool_result", name: tu.name, ok: true, durationMs: Date.now() - startMs, detail });
-      return {
-        state: { ...state, storyChecked: true },
-        result: {
-          type: "tool_result",
-          toolUseId: tu.id,
-          content: JSON.stringify({
-            ...detail,
-            instruction:
-              "Nothing was applied. Check these before the plan goes to review. If keeping the dialogue " +
-              "running is the better story, revise the plan and call propose_edit_plan again. If stopping " +
-              "there is genuinely what the user asked for, call propose_edit_plan again with the same plan.",
-          }),
-        },
-        stopAfterThisRound: false,
-      };
-    }
-  }
-
   let plan = renderPlanForConfirmation(state.session.state, parsed.data);
 
   // ── Critic review, BEFORE the user sees the plan (3G, decision 1) ──────────
@@ -502,6 +537,20 @@ async function handleProposePlan(
     }
   }
 
+  return confirmAndApply(tu, state, input, plan, startMs);
+}
+
+/**
+ * The shared end of both terminal tools: the user's confirm gate (unless
+ * auto-approve), then ONE applyPlan labeled with the user's prompt.
+ */
+async function confirmAndApply(
+  tu: ToolUseBlock,
+  state: AgentState,
+  input: AgentInput,
+  plan: PlanForConfirmation,
+  startMs: number,
+): Promise<ToolHandled> {
   // Confirm (unless auto-approve)
   let approved = true;
   if (!state.autoApprove) {
@@ -565,6 +614,98 @@ async function handleProposePlan(
     },
     stopAfterThisRound: false,
   };
+}
+
+// ── propose_program ───────────────────────────────────────────────────────────
+
+/**
+ * A story edit as a program (src/edit/program.ts). The program is compiled to
+ * operations — synced angles lined up from measured offsets — then a reviewer
+ * watches a draft of the result. Major notes go back to the director to
+ * revise (bounded by MAX_CRITIC_REVISIONS and the tool budget); otherwise the
+ * user confirms a shot list and the operations apply as one undo entry.
+ */
+async function handleProposeProgram(
+  tu: ToolUseBlock,
+  state: AgentState,
+  input: AgentInput,
+  reviewer: ReviewerFn,
+  startMs: number,
+): Promise<ToolHandled> {
+  const fail = (message: string): ToolHandled => {
+    input.onProgress?.({ type: "tool_result", name: tu.name, ok: false, durationMs: Date.now() - startMs, detail: message });
+    return { state, result: { type: "tool_result", toolUseId: tu.id, content: message, isError: true }, stopAfterThisRound: false };
+  };
+  const parsed = ProposeProgramInputSchema.safeParse(tu.input);
+  if (!parsed.success) return fail(`Program failed validation: ${parsed.error.message}`);
+  const program = parsed.data.program as Program;
+
+  // Synced angles need measured offsets; measure with this spine as the
+  // reference if the project doesn't have them yet.
+  const needsSync = program.shots.some((sh) => sh.angle !== program.spine && sh.sourceIn === undefined);
+  if (needsSync && !syncIsCurrent(state.session.state, program.spine)) {
+    try {
+      const sync = await measureProjectSync(state.session.state, program.spine);
+      state = { ...state, session: { ...state.session, state: { ...state.session.state, sync } } };
+    } catch { /* compile reports which angles lack sync */ }
+  }
+
+  // The reviewer's measured facts need the spine's silence (audio-only, cached,
+  // well under a second). Measure it here rather than relying on the director.
+  {
+    const r = await executeDetectSilence(state.session.state, { sourceId: program.spine, ...CUT_SILENCE }).catch(() => null);
+    if (r && r.ok && r.stateUpdate) state = { ...state, session: { ...state.session, state: r.stateUpdate } };
+  }
+
+  const compiled = compileProgram(state.session.state, program);
+  if (!compiled.ok) return fail(`Program can't be built: ${compiled.error}`);
+  const scratch = applyOperations(state.session.state, compiled.ops);
+  if (!scratch.ok) return fail(`Program can't be applied: operation ${scratch.failedAt + 1} fails: ${scratch.error}`);
+
+  let outstanding: CriticConcern[] | undefined;
+  if (input.criticEnabled !== false) {
+    input.onProgress?.({ type: "critic_start" });
+    let review: Awaited<ReturnType<ReviewerFn>>;
+    try {
+      review = await reviewer({ userRequest: lastUserPromptFrom(state.messages), state: scratch.state });
+    } catch {
+      review = { verdict: "approve", notes: [], shots: [] };
+    }
+    const clock = (t: number) => `${Math.floor(t / 60)}:${(t % 60).toFixed(1).padStart(4, "0")}`;
+    const concerns: CriticConcern[] = review.notes.map((n) => ({ severity: n.severity, issue: `at ${clock(n.time)}: ${n.issue}` }));
+    input.onProgress?.({ type: "critic_verdict", verdict: review.verdict, concerns: concerns.length, concernDetails: concerns });
+
+    if (review.verdict === "revise") {
+      if (state.criticRevisions < MAX_CRITIC_REVISIONS && state.toolBudget > 0) {
+        const detail = { status: "review", notes: concerns, shotList: review.shots, measured: review.facts ?? [] };
+        input.onProgress?.({ type: "tool_result", name: tu.name, ok: true, durationMs: Date.now() - startMs, detail });
+        return {
+          state: { ...state, criticRevisions: state.criticRevisions + 1 },
+          result: {
+            type: "tool_result",
+            toolUseId: tu.id,
+            content: JSON.stringify({
+              ...detail,
+              instruction:
+                "Nothing was applied. A reviewer watched a draft of this cut (times are seconds into the cut, as in " +
+                "the shot list). `measured` gives exact silent stretches with their source times, so a note about " +
+                "length maps straight onto `keep`. Revise the program to fix the major notes and call propose_program again.",
+            }),
+          },
+          stopAfterThisRound: false,
+        };
+      }
+      outstanding = concerns;
+    }
+  }
+
+  const plan: PlanForConfirmation = {
+    summary: parsed.data.summary,
+    operations: compiled.ops,
+    renderedLines: renderShotList(shotList(scratch.state)),
+    ...(outstanding && outstanding.length > 0 ? { outstandingConcerns: outstanding } : {}),
+  };
+  return confirmAndApply(tu, state, input, plan, startMs);
 }
 
 // ── Finalization ──────────────────────────────────────────────────────────────

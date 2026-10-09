@@ -15,6 +15,9 @@ import {
 } from "../../project/session.js";
 import { setClipUserLabel, clearClipUserLabel } from "../../project/mutations.js";
 import { getDefaultIndexRegistry } from "../../agent/indexing.js";
+import { prefetchSource } from "../../agent/prefetch.js";
+import { realBackend as transcriptionBackend } from "../../agent/backends/transcription.js";
+import { realBeatsBackend } from "../../agent/tools/map_visual_beats.js";
 import { paint, glyphs } from "../../ui/theme.js";
 import { loadOrCreateProject, saveProjectToStandardPath } from "../../cli/project-context.js";
 import { parseTime } from "../../utils/time.js";
@@ -24,7 +27,7 @@ import { runTransitionCommand, runFadeCommand, type EdgeCommandResult } from "./
 import { runAgent, type AgentInput, type ProgressEvent } from "../../agent/loop.js";
 import type { PlanForConfirmation } from "../../agent/propose_edit_plan.js";
 import { parsePreviewArgs, previewStateScope, type PreviewDeps } from "./preview.js";
-import { getSessionTotals, renderCostReport } from "../cost.js";
+import { getSessionTotals, getCallLog, renderCostReport } from "../cost.js";
 import { saveSession, loadSession } from "../session-store.js";
 import { compactHistory, shouldAutoCompact, type CompactResult } from "../compaction.js";
 import { buildDefaultProvider, DEFAULT_PROVIDER_INFO } from "../../agent/providers/default.js";
@@ -224,6 +227,20 @@ async function dispatchOpen(args: string[], state: ReplState): Promise<DispatchR
   if (process.env["TWELVELABS_API_KEY"] && newSource.analyses.twelveLabs?.status !== "indexed") {
     getDefaultIndexRegistry().start({ id: newSource.id, filePath: newSource.filePath });
     indexNote = "\n" + paint.muted(`${glyphs.sync} visual indexing started in background`);
+  }
+
+  // Prepare the rest of the per-source perception the same way (prefetch.ts):
+  // the transcript and the visual beat map (which also builds the source's
+  // 720p master proxy). Each only with its key, and only if not already cached.
+  const started = prefetchSource({
+    ...(process.env["OPENAI_API_KEY"] && newSource.audioCodec && !newSource.analyses.transcript
+      ? { transcribe: () => transcriptionBackend.transcribe(newSource.filePath, newSource.duration) } : {}),
+    ...(process.env["GEMINI_API_KEY"] && !newSource.analyses.visualBeats
+      ? { mapVisualBeats: () => realBeatsBackend.mapVisualBeats(newSource.filePath, newSource.duration) } : {}),
+  });
+  if (started.length > 0) {
+    const what = started.map((n) => (n === "transcribe" ? "transcript" : "visual map")).join(" and ");
+    indexNote += "\n" + paint.muted(`${glyphs.sync} ${what} preparing in background`);
   }
 
   const clipCount = clipsInOrder(result.session.state.timeline).length;
@@ -714,7 +731,7 @@ function dispatchClear(state: ReplState): DispatchResult {
 // default provider's tap as turns complete; this just renders the fold.
 
 function dispatchCost(): DispatchResult {
-  return { output: renderCostReport(getSessionTotals()), isError: false };
+  return { output: renderCostReport(getSessionTotals(), getCallLog()), isError: false };
 }
 
 // ── Agent (non-slash input) ───────────────────────────────────────────────────

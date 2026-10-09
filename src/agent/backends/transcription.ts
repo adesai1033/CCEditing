@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { memoized } from "../prefetch.js";
 import { promisify } from "node:util";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { createReadStream } from "node:fs";
@@ -265,5 +266,10 @@ export async function transcribe(
   return { segments, duration, hasAudio: true };
 }
 
-export const realBackend = { transcribe };
-export type TranscriptionBackend = typeof realBackend;
+/** The production backend: memoized per file, so a transcript started in the
+ *  background at /open (agent/prefetch.ts) is reused rather than redone. */
+export const realBackend = {
+  transcribe: (filePath: string, duration: number) =>
+    memoized("transcript", filePath, () => transcribe(filePath, duration)),
+};
+export type TranscriptionBackend = { transcribe: (filePath: string, duration: number) => Promise<TranscriptionResult> };

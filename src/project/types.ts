@@ -264,6 +264,25 @@ export interface ProjectState {
   updatedAt: string;      // ISO timestamp
   sources: SourceFile[];
   timeline: Timeline;
+  /** Measured audio sync between sources (media/sync.ts). Absent until measured. */
+  sync?: ProjectSync;
+}
+
+/** Sources recorded at the same time, with measured offsets: source time = reference time + offset. */
+export interface ProjectSync {
+  referenceSourceId: string;
+  offsets: Record<string, { offset: number; evidence: string }>;
+  unsynced: Array<{ id: string; reason: string }>;
+  measuredAt: string;
+}
+
+/** Offset between two synced sources (b time = a time + result), or null if either isn't synced. */
+export function syncOffset(sync: ProjectSync | undefined, a: string, b: string): number | null {
+  if (!sync) return null;
+  const oa = sync.offsets[a];
+  const ob = sync.offsets[b];
+  if (!oa || !ob) return null;
+  return ob.offset - oa.offset;
 }
 
 // Returned by every mutation — callers handle errors explicitly

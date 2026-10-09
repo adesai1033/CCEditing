@@ -398,10 +398,7 @@ program
 
     const result = await exportTimeline(state, path.resolve(output), {
       onStep: (step) => {
-        if (step.kind === "trim") process.stdout.write(`  [${step.index + 1}/${step.total}] Trimming ${step.detail}...`);
-        else if (step.kind === "concat") process.stdout.write("  Concatenating segments...");
-        else if (step.kind === "join") process.stdout.write(`  Joining with ${step.detail}...`);
-        else process.stdout.write(`  Compositing ${step.detail}...`);
+        process.stdout.write(`  Rendering ${step.detail} in one pass...`);
       },
       onStepDone: () => process.stdout.write(chalk.green("  done\n")),
     });

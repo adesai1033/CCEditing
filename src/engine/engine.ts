@@ -6,7 +6,7 @@ import path from "node:path";
 import os from "node:os";
 import type { EditOperation, TrimOperation, ConcatOperation, JoinOperation, OverlayOperation } from "./types.js";
 import { validateTrim } from "./validator.js";
-import { buildArgs, buildConcatFileContent, type FrameSize, type JoinTarget } from "./ffmpeg.js";
+import { buildArgs, buildConcatFileContent, conformTarget, type FrameSize, type JoinTarget } from "./ffmpeg.js";
 import { probeFile } from "../media/probe.js";
 
 const execFileAsync = promisify(execFile);
@@ -89,14 +89,17 @@ async function validateOperation(op: EditOperation): Promise<{ ok: true; duratio
       if (withAudio > 0 && withAudio < joinOp.segments.length) {
         return { ok: false, error: "Transitions need every clip to have audio, or none of them to" };
       }
-      // The first segment sets the frame size and rate everything else is
-      // conformed to (xfade refuses mismatched inputs).
-      const probe = await probeFile(joinOp.segments[0]!.path);
-      if (!probe.ok) return { ok: false, error: probe.error };
+      // Every segment is conformed to the largest one (xfade refuses
+      // mismatched inputs; see conformTarget for why not the first).
+      const probes = await Promise.all(joinOp.segments.map((seg) => probeFile(seg.path)));
+      const bad = probes.find((p) => !p.ok);
+      if (bad && !bad.ok) return { ok: false, error: bad.error };
+      const infos = probes.map((p) => (p as Extract<typeof p, { ok: true }>).data)
+        .map((d) => ({ width: d.width, height: d.height, fps: d.fps || 30 }));
       return {
         ok: true,
         duration: joinOp.segments.reduce((s, seg) => s + seg.duration, 0),
-        base: { width: probe.data.width, height: probe.data.height, fps: probe.data.fps || 30 },
+        base: conformTarget(infos),
       };
     }
     case "overlay": {

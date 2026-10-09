@@ -32,6 +32,12 @@ export interface QueryTimelineOutput {
     audioPresent: boolean;
     audioCodec: string | null;
   }>;
+  // Measured audio sync between sources recorded at the same time (sync_sources), if measured.
+  sync: null | {
+    reference: string;
+    synced: Array<{ sourceId: string; fileName: string; offset: number }>;
+    unsynced: Array<{ sourceId: string; fileName: string; reason: string }>;
+  };
   // Every project source (a clip's or an overlay's) — addOverlay takes one of these ids.
   sources: Array<{ id: string; fileName: string; duration: number; width: number; height: number }>;
   // The overlay track (picture-in-picture), bottom → top. Times: `at` is
@@ -110,7 +116,18 @@ async function execute(state: ProjectState, _input: QueryTimelineInput): Promise
     label: o.label,
   }));
 
-  return { ok: true, result: { totalDuration, clips, sources, overlays } };
+  const nameOf = (id: string) => sourceMap.get(id)?.fileName ?? id;
+  const sync = state.sync
+    ? {
+        reference: nameOf(state.sync.referenceSourceId),
+        synced: Object.entries(state.sync.offsets)
+          .filter(([id]) => id !== state.sync!.referenceSourceId)
+          .map(([id, o]) => ({ sourceId: id, fileName: nameOf(id), offset: o.offset })),
+        unsynced: state.sync.unsynced.map((u) => ({ sourceId: u.id, fileName: nameOf(u.id), reason: u.reason })),
+      }
+    : null;
+
+  return { ok: true, result: { totalDuration, clips, sync, sources, overlays } };
 }
 
 const schema: ToolSchema = {

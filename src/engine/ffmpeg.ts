@@ -16,26 +16,32 @@ export interface EncodeSettings {
 }
 
 /** The export defaults — full resolution, near-transparent quality. */
-export const EXPORT_ENCODE: EncodeSettings = { crf: 18, preset: "fast" };
+/** The export defaults — full resolution, near-transparent quality, and
+ *  audio at a bitrate that doesn't fall below a phone camera's AAC (an unset
+ *  bitrate measured 83 kbps on the final video). */
+export const EXPORT_ENCODE: EncodeSettings = { crf: 18, preset: "fast", audioBitrate: "256k" };
 
 /**
  * Build the FFmpeg argument list for a trim operation.
  *
- * Strategy: output seeking (-ss after -i) forces FFmpeg to decode every frame
- * from the nearest keyframe to the exact timestamp, giving frame-accurate cuts.
- * We re-encode the video (libx264) because stream copy cannot produce
- * frame-accurate cuts — it can only split on keyframe boundaries. Audio is
- * re-encoded to AAC to stay in sync with the new video segment.
+ * Seeking: INPUT seeking (-ss/-t before -i). When re-encoding, FFmpeg decodes
+ * from the keyframe before the cut and discards up to the exact timestamp, so
+ * the first emitted frame is the requested one. Measured on a 4K/60fps HEVC
+ * source: a 3 s cut at 2:02 came out frame-identical (PSNR ∞, same 180
+ * frames) to the old output seeking (-ss after -i), in 14 s instead of 115 s —
+ * output seeking decodes the file from its start to every cut point. On macOS
+ * decoding is hardware accelerated (also frame-identical).
  *
- * Tradeoff vs stream copy: slower (seconds vs milliseconds for large files),
- * but the output starts and ends on the exact requested frame.
+ * We re-encode the video (libx264) because stream copy can only cut on
+ * keyframes. Audio is re-encoded to AAC at the encode's bitrate.
  */
-export function buildTrimArgs(op: TrimOperation, enc: EncodeSettings = EXPORT_ENCODE): string[] {
+export function buildTrimArgs(op: TrimOperation, enc: EncodeSettings = EXPORT_ENCODE, platform: NodeJS.Platform = process.platform): string[] {
   const duration = op.end - op.start;
   return [
-    "-i", op.input,
+    ...(platform === "darwin" ? ["-hwaccel", "videotoolbox"] : []),
     "-ss", String(op.start),
     "-t", String(duration),
+    "-i", op.input,
     // The comma inside min() is escaped so the filter parser doesn't read it
     // as a filter separator.
     ...(enc.maxHeight !== undefined ? ["-vf", `scale=-2:min(${enc.maxHeight}\\,ih)`] : []),
@@ -76,6 +82,20 @@ export function formatsMatch(infos: Array<{ width: number; height: number; fps: 
   return rest.every((i) => i.width === first.width && i.height === first.height && Math.abs(i.fps - first.fps) < 0.01);
 }
 
+/**
+ * The frame every joined segment is conformed to: the LARGEST segment's size
+ * (by pixel count) and the highest frame rate among them. Picking the first
+ * segment instead would quietly downscale a whole 4K video to 1080p whenever a
+ * smaller clip happened to come first — the output must never be lower
+ * resolution than its best source.
+ */
+export function conformTarget(infos: JoinTarget[]): JoinTarget {
+  if (infos.length === 0) throw new Error("conformTarget needs at least one segment");
+  const size = infos.reduce((best, i) => (i.width * i.height > best.width * best.height ? i : best));
+  const fps = Math.max(...infos.map((i) => i.fps || 0)) || 30;
+  return { width: size.width, height: size.height, fps };
+}
+
 /** True when the segments need the filter-graph join rather than a stream copy. */
 export function joinNeedsFilter(segments: JoinSegment[]): boolean {
   return segments.some((s, i) =>
@@ -91,8 +111,18 @@ export function joinNeedsFilter(segments: JoinSegment[]): boolean {
  * overlap begins in the accumulated output) or hard-concatenated to it.
  * Audio is joined only when EVERY segment has it; a mix is rejected upstream.
  */
-export function buildJoinFilter(segments: JoinSegment[], target: JoinTarget): { filter: string; audio: boolean } {
-  const audio = segments.every((s) => s.hasAudio);
+export interface JoinFilterOptions {
+  /** Output pad names (default [vout] / [aout]). */
+  labels?: { video: string; audio: string };
+  /** Generate silence for segments without audio instead of dropping audio
+   *  for the whole join (the single-pass render uses this). */
+  synthesizeSilence?: boolean;
+}
+
+export function buildJoinFilter(segments: JoinSegment[], target: JoinTarget, opts: JoinFilterOptions = {}): { filter: string; audio: boolean } {
+  const vOut = opts.labels?.video ?? "[vout]";
+  const aOut = opts.labels?.audio ?? "[aout]";
+  const audio = opts.synthesizeSilence ? segments.some((s) => s.hasAudio) : segments.every((s) => s.hasAudio);
   const parts: string[] = [];
 
   segments.forEach((seg, i) => {
@@ -114,7 +144,11 @@ export function buildJoinFilter(segments: JoinSegment[], target: JoinTarget): { 
       a.push(`afade=t=out:st=${num(st)}:d=${num(fo)}`);
     }
     parts.push(`[${i}:v]${v.join(",")}[v${i}]`);
-    if (audio) parts.push(`[${i}:a]${a.join(",")}[a${i}]`);
+    if (audio) {
+      parts.push(seg.hasAudio
+        ? `[${i}:a]${a.join(",")}[a${i}]`
+        : `aevalsrc=0:c=stereo:s=48000:d=${num(seg.duration)},aformat=sample_fmts=fltp:channel_layouts=stereo[a${i}]`);
+    }
   });
 
   // Fold left: [acc] ⊕ [next] → [acc'] tracking the accumulated duration so
@@ -126,8 +160,8 @@ export function buildJoinFilter(segments: JoinSegment[], target: JoinTarget): { 
     const prev = segments[i - 1]!;
     const seg = segments[i]!;
     const last = i === segments.length - 1;
-    const outV = last ? "[vout]" : `[vj${i}]`;
-    const outA = last ? "[aout]" : `[aj${i}]`;
+    const outV = last ? vOut : `[vj${i}]`;
+    const outA = last ? aOut : `[aj${i}]`;
     const d = Math.min(prev.transitionOut?.duration ?? 0, accDur, seg.duration);
     if (d > 0) {
       const type = prev.transitionOut!.type;
@@ -145,8 +179,8 @@ export function buildJoinFilter(segments: JoinSegment[], target: JoinTarget): { 
   }
   if (segments.length === 1) {
     // Nothing to join: rename the normalized single input to the output pads.
-    parts[0] = parts[0]!.replace(/\[v0\]$/, "[vout]");
-    if (audio) parts[1] = parts[1]!.replace(/\[a0\]$/, "[aout]");
+    parts[0] = parts[0]!.replace(/\[v0\]$/, vOut);
+    if (audio) parts[1] = parts[1]!.replace(/\[a0\]$/, aOut);
   }
   return { filter: parts.join(";"), audio };
 }
@@ -234,15 +268,23 @@ const num = (n: number): string => Number(n.toFixed(3)).toString();
  * keeps the base going; `enable` pins the exact window so a trailing frame is
  * never held past the out-point.
  */
-export function buildOverlayFilter(layers: OverlayLayer[], base: FrameSize): string {
+export interface OverlayFilterOptions {
+  /** Pad holding the base picture (default [0:v]). */
+  baseLabel?: string;
+  /** Input index of the first layer (default 1). */
+  firstInput?: number;
+}
+
+export function buildOverlayFilter(layers: OverlayLayer[], base: FrameSize, opts: OverlayFilterOptions = {}): string {
   const parts: string[] = [];
-  let last = "[0:v]";
+  let last = opts.baseLabel ?? "[0:v]";
+  const first = opts.firstInput ?? 1;
   layers.forEach((layer, i) => {
     const p = computeOverlayPlacement(layer, base);
     const dur = layer.outPoint - layer.inPoint;
     const ov = `[ov${i}]`;
-    const out = i === layers.length - 1 ? "[vout]" : `[v${i}]`;
-    parts.push(`[${i + 1}:v]${layerScaleFilter(layer, p, base)},setpts=PTS-STARTPTS+${num(layer.at)}/TB${ov}`);
+    const out = i === layers.length - 1 ? "[vout]" : `[vo${i}]`;
+    parts.push(`[${first + i}:v]${layerScaleFilter(layer, p, base)},setpts=PTS-STARTPTS+${num(layer.at)}/TB${ov}`);
     parts.push(
       `${last}${ov}overlay=x=${p.x}:y=${p.y}:eof_action=pass` +
       `:enable=between(t\\,${num(layer.at)}\\,${num(layer.at + dur)})${out}`,
@@ -278,6 +320,66 @@ export function buildOverlayArgs(op: OverlayOperation, base: FrameSize, enc: Enc
     "-c:a", "copy",
     "-y",
     op.output,
+  ];
+}
+
+// ── Single-pass render ────────────────────────────────────────────────────────
+
+/** One main-track clip of a render: a range of a source plus its edge effects. */
+export interface RenderClip {
+  input: string;
+  start: number;
+  duration: number;
+  hasAudio: boolean;
+  fadeIn?: number;
+  fadeOut?: number;
+  transitionOut?: JoinSegment["transitionOut"];
+}
+
+export interface RenderPlan {
+  clips: RenderClip[];
+  layers: OverlayLayer[];     // `at` in timeline time
+  target: JoinTarget;         // the output frame (conformTarget of the sources)
+  output: string;
+}
+
+/**
+ * The whole timeline in ONE FFmpeg invocation, straight from the sources:
+ * every clip and overlay is an input trimmed by input seeking; the main track
+ * is conformed and joined (cuts, transitions, fades) and the overlays are
+ * composited on top inside one filter graph, then encoded once. The
+ * trim → join → composite pipeline encoded the video three times — three
+ * generations of loss and three passes of 4K encoding.
+ */
+export function buildRenderArgs(plan: RenderPlan, enc: EncodeSettings = EXPORT_ENCODE, platform: NodeJS.Platform = process.platform): string[] {
+  if (plan.clips.length === 0) throw new Error("Nothing to render");
+  const hw = platform === "darwin" ? ["-hwaccel", "videotoolbox"] : [];
+  const inputs: string[] = [];
+  for (const c of plan.clips) inputs.push(...hw, "-ss", num(c.start), "-t", num(c.duration), "-i", c.input);
+  for (const l of plan.layers) inputs.push(...hw, "-ss", num(l.inPoint), "-t", num(l.outPoint - l.inPoint), "-i", l.input);
+
+  const joinSegs: JoinSegment[] = plan.clips.map((c) => ({
+    path: c.input, duration: c.duration, hasAudio: c.hasAudio,
+    fadeIn: c.fadeIn, fadeOut: c.fadeOut, transitionOut: c.transitionOut ?? null,
+  }));
+  const layered = plan.layers.length > 0;
+  const join = buildJoinFilter(joinSegs, plan.target, {
+    labels: { video: layered ? "[vbase]" : "[vout]", audio: "[aout]" },
+    synthesizeSilence: true,
+  });
+  const graph = layered
+    ? `${join.filter};${buildOverlayFilter(plan.layers, plan.target, { baseLabel: "[vbase]", firstInput: plan.clips.length })}`
+    : join.filter;
+
+  return [
+    ...inputs,
+    "-filter_complex", graph,
+    "-map", "[vout]",
+    ...(join.audio ? ["-map", "[aout]"] : []),
+    "-c:v", "libx264", "-crf", String(enc.crf), "-preset", enc.preset, "-pix_fmt", "yuv420p",
+    ...(join.audio ? ["-c:a", "aac", ...(enc.audioBitrate !== undefined ? ["-b:a", enc.audioBitrate] : [])] : []),
+    "-movflags", "+faststart",
+    "-y", plan.output,
   ];
 }
 

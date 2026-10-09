@@ -1,6 +1,7 @@
 import { ToolRegistry, buildPerceptionRegistry } from "./perception-registry.js";
 import { surveySources } from "./tools/survey_sources.js";
 import { proposeEditPlanSchema } from "./propose_edit_plan.js";
+import { proposeProgramSchema } from "./propose_program.js";
 
 export type { ToolExecute, ToolEntry } from "./perception-registry.js";
 export { ToolRegistry };
@@ -18,5 +19,6 @@ export function buildDefaultRegistry(): ToolRegistry {
   const r = buildPerceptionRegistry();
   r.registerDirectorTool(surveySources);
   r.registerTerminalSchema(proposeEditPlanSchema);
+  r.registerTerminalSchema(proposeProgramSchema);
   return r;
 }

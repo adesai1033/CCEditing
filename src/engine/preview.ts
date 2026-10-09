@@ -6,7 +6,7 @@ import path from "node:path";
 import os from "node:os";
 import type { TrimOperation, OverlayLayer, JoinSegment } from "./types.js";
 import type { Transition } from "../project/types.js";
-import { buildTrimArgs, buildConcatFileContent, buildOverlayArgs, buildJoinArgs, joinNeedsFilter, formatsMatch, type EncodeSettings, type JoinTarget } from "./ffmpeg.js";
+import { buildTrimArgs, buildConcatFileContent, buildOverlayArgs, buildJoinArgs, joinNeedsFilter, formatsMatch, conformTarget, type EncodeSettings, type JoinTarget } from "./ffmpeg.js";
 import { probeFile } from "../media/probe.js";
 
 /**
@@ -301,9 +301,10 @@ export async function renderPreviewFromSegments(
 
   let joined: FfmpegRunResult;
   if (filterJoin) {
-    // xfade/concat need conformed inputs: the first segment sets the target.
-    const target = await probe(segmentPaths[0]!);
-    if (!target) return { ok: false, code: "FFMPEG_FAILED", error: "Could not read the rendered segment's dimensions." };
+    // xfade/concat need conformed inputs: the largest segment sets the target.
+    const probed = await Promise.all(segmentPaths.map((p) => probe(p)));
+    if (probed.some((t) => !t)) return { ok: false, code: "FFMPEG_FAILED", error: "Could not read the rendered segment's dimensions." };
+    const target = conformTarget(probed as JoinTarget[]);
     joinSegments.forEach((j, i) => { j.path = segmentPaths[i]!; });
     const joinedDuration = joinSegments.reduce((s, j, i) =>
       s + j.duration - (i < joinSegments.length - 1 ? Math.min(j.transitionOut?.duration ?? 0, j.duration) : 0), 0);

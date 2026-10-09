@@ -39,25 +39,19 @@ describe("cutaway recipe from the system prompt", () => {
     ]);
   });
 
-  test("the prompt teaches both cutaway patterns and the story-edit method", () => {
+  test("the prompt teaches story edits as multicam programs", () => {
     const p = staticSystemPrefix();
-    // Cutaway over continuous sound (B-roll) vs. a cutaway with its own sound.
-    assert.match(p, /MAIN TRACK'S SOUND KEEPS PLAYING/);
+    assert.match(p, /## Story edits: propose_program/);
+    assert.match(p, /spine: the source whose SOUND carries the story/);
+    assert.match(p, /cues are anchors/);
+    assert.match(p, /Never pick a 'matching moment' of a synced source by its description; the sync already is the match/);
+    assert.match(p, /\\"full\\" \(default\) shows the whole picture|"full" \(default\) shows the whole picture/);
+    assert.match(p, /Rapid back-and-forth between angles reads as random/);
+    // The fragmenting rule and the gate-era worked example are gone.
+    assert.doesNotMatch(p, /usually 2–10s each/);
+    assert.doesNotMatch(p, /Worked example/);
+    // Direct edits keep the operation route.
     assert.match(p, /## Cutting away with the cutaway's own sound/);
-    assert.match(p, /split the spine at the cut point.*newClipId/s);
-    // Story edits: spine, full read, finish the story, concise, matched cutaways.
-    assert.match(p, /## Story edits/);
-    assert.match(p, /Pick the spine/);
-    assert.match(p, /Read the spine's full transcript/);
-    assert.match(p, /Finish the story/);
-    assert.match(p, /keepRanges on the spine/);
-    assert.match(p, /map_visual_beats on every B-roll/);
-    assert.match(p, /atSource/);
-    // The decision rules that the first story run missed.
-    assert.match(p, /Pick the spine BY SOUND/);
-    assert.match(p, /means switch the PICTURE to X/);
-    assert.match(p, /Read PAST the user's last cue/);
-    assert.match(p, /Worked example/);
   });
 });
 

@@ -122,7 +122,7 @@ export class AnthropicProvider implements ChatProvider {
 
   private buildParams(request: ChatRequest): Anthropic.Messages.MessageCreateParamsNonStreaming {
     const params: Anthropic.Messages.MessageCreateParamsNonStreaming = {
-      model: this.model,
+      model: request.model ?? this.model,
       system: toAnthropicSystem(request.system),
       messages: request.messages.map(toAnthropicMessage),
       tools: request.tools.map(toAnthropicTool),
